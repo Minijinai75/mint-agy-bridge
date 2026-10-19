@@ -145,3 +145,12 @@ test('config: bad values are ignored, runtime patch only touches runtime keys, a
   assert.equal(cfg.apiKey, '');
   assert.equal(publicConfig({ ...cfg, apiKey: 'secret' }).apiKey, '(set)');
 });
+
+test('agy environment: auto-update off, retries from config, ADC only when asked', async () => {
+  const { agyEnv } = await import('../lib/agy.mjs');
+  const e = agyEnv({ ...DEFAULTS, maxRetries: 2 });
+  assert.equal(e.AGY_CLI_DISABLE_AUTO_UPDATE, '1');
+  assert.equal(e.AGY_CLI_MODEL_API_MAX_RETRIES, '2');
+  assert.equal(e.AGY_ADC_AUTH, process.env.AGY_ADC_AUTH);
+  assert.equal(agyEnv({ ...DEFAULTS, adcAuth: true }).AGY_ADC_AUTH, 'true');
+});

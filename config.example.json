@@ -1,0 +1,13 @@
+{
+  "port": 5499,
+  "host": "127.0.0.1",
+  "apiKey": "",
+  "agyPath": "",
+  "adcAuth": false,
+  "defaultModel": "",
+  "printTimeoutSec": 300,
+  "maxRetries": 0,
+  "cleanupConversations": true,
+  "resumeMinutes": 15,
+  "usageLog": true
+}
