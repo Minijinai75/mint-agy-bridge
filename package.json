@@ -1,0 +1,14 @@
+{
+  "name": "mint-agy-bridge",
+  "version": "0.1.0",
+  "description": "SillyTavern server plugin: an OpenAI-compatible endpoint backed by the official Antigravity CLI (agy).",
+  "type": "module",
+  "main": "index.mjs",
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node standalone.mjs",
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "keywords": ["sillytavern", "sillytavern-plugin", "antigravity", "agy", "gemini"]
+}
