@@ -8,7 +8,7 @@
   "engines": { "node": ">=18" },
   "scripts": {
     "start": "node standalone.mjs",
-    "test": "node --test \"test/*.test.mjs\""
+    "test": "node --test test/units.test.mjs test/bridge.test.mjs"
   },
   "keywords": ["sillytavern", "sillytavern-plugin", "antigravity", "agy", "gemini"]
 }
