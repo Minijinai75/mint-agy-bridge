@@ -78,9 +78,9 @@ test('no "stream" field → non-streaming chat.completion (OpenAI default)', asy
   assert.equal(j.usage.prompt_tokens, 100);
 });
 
-test('model not in the account list → 400 with the list, agy never started', async () => {
+test('model not in the account list → error with the list (400 stream / 200+error json), agy never started', async () => {
   fs.rmSync(argsOut, { force: true });
-  const res = await chat({ model: 'claude-opus-4-6', messages: msgs('x') });
+  const res = await chat({ model: 'claude-opus-4-6', messages: msgs('x'), stream: true });
   assert.equal(res.status, 400);
   assert.match((await res.json()).error.message, /gemini-4-argon-high/);
   assert.ok(!fs.existsSync(argsOut));
@@ -93,10 +93,14 @@ test('no model in request → first listed model', async () => {
 });
 
 // ── errors ────────────────────────────────────────────────────────────────
-test('429 before any text → HTTP 502 with a readable message (stream and json), not a chat reply', async () => {
+// Non-streaming failures are HTTP 200 + {error}: SillyTavern's backend drops the body of a non-2xx
+// non-streaming reply and shows only "Bad Gateway".
+const failStatus = stream => (stream ? 502 : 200);
+
+test('429 before any text → readable error, not a chat reply (502 stream / 200+error json)', async () => {
   for (const stream of [true, false]) {
     const res = await chat({ model: M, messages: msgs('#429'), stream });
-    assert.equal(res.status, 502);
+    assert.equal(res.status, failStatus(stream));
     assert.match((await res.json()).error.message, /薄荷橋：.*配額不夠/);
   }
 });
@@ -122,11 +126,11 @@ test('content filter after text → agy stopped at once, text kept, error event 
   assert.equal(_state().lastTurn.contentBlocked, true);
 });
 
-test('content filter before any text → HTTP 502 with the filter message, quickly (stream and json)', async () => {
+test('content filter before any text → the filter message, quickly (stream and json)', async () => {
   for (const stream of [true, false]) {
     const t0 = Date.now();
     const res = await chat({ model: M, messages: msgs('#filter0'), stream });
-    assert.equal(res.status, 502);
+    assert.equal(res.status, failStatus(stream));
     assert.match((await res.json()).error.message, /薄荷橋：被 Google 的內容過濾擋下了/);
     assert.ok(Date.now() - t0 < 8000, `took ${Date.now() - t0} ms`);
   }
@@ -144,20 +148,54 @@ test('bridge timeout → says the bridge stopped agy after N s; no misleading "e
 
 test('agy exits with code 1 and says nothing → its own readable message, not the timeout one', async () => {
   const res = await chat({ model: M, messages: msgs('#exit1') });
-  assert.equal(res.status, 502);
+  assert.equal(res.status, 200);   // non-streaming: 200 + error
+  assert.equal((await res.clone().json()).choices, undefined);
   const m = (await res.json()).error.message;
   assert.match(m, /agy 自己中途結束了（代碼 1）/);
   assert.doesNotMatch(m, /停掉了 agy/);
 });
 
-test('max_tokens: long reply is stopped near the limit with finish_reason "length" (stream and json)', async () => {
-  const s = await sseText(await chat({ model: M, messages: msgs('#long'), stream: true, max_tokens: 50 }));
+test('max_tokens: long reply is stopped near the limit with finish_reason "length", agy killed (stream and json)', async () => {
+  const t0 = Date.now();
+  const s = await sseText(await chat({ model: M, messages: msgs('#long #stall'), stream: true, max_tokens: 50 }));
+  assert.ok(Date.now() - t0 < 8000, `took ${Date.now() - t0} ms (fake agy stalls 20 s after its text)`);
   assert.equal(s.finish, 'length'); assert.ok(s.done); assert.deepEqual(s.errors, []);
   assert.ok(s.text.length >= 50 && s.text.length < 80, `got ${s.text.length} chars`);
   assert.equal(_state().lastTurn.capped, true);
   const j = await (await chat({ model: M, messages: msgs('#long'), max_tokens: 50 })).json();
   assert.equal(j.choices[0].finish_reason, 'length');
   assert.ok(j.choices[0].message.content.length < 80);
+});
+
+test('reply that itself quotes the filter sentence is NOT treated as filtered', async () => {
+  for (const stream of [true, false]) {
+    const res = await chat({ model: M, messages: msgs('#quote'), stream });
+    assert.equal(res.status, 200);
+    if (stream) {
+      const s = await sseText(res);
+      assert.deepEqual(s.errors, []); assert.equal(s.finish, 'stop');
+      assert.match(s.text, /blocked by content safety filters/);
+    } else {
+      const j = await res.json();
+      assert.equal(j.error, undefined);
+      assert.match(j.choices[0].message.content, /Prohibited Use policy/);
+    }
+    assert.equal(_state().lastTurn.contentBlocked, false);
+  }
+});
+
+test('max_completion_tokens wins over max_tokens; non-integer values are ignored', async () => {
+  const a = await (await chat({ model: M, messages: msgs('#long'), max_tokens: 4000, max_completion_tokens: 30 })).json();
+  assert.equal(a.choices[0].finish_reason, 'length');
+  assert.equal(_state().lastTurn.maxTokens, 30);
+  const b = await (await chat({ model: M, messages: msgs('#long'), max_tokens: 30.5 })).json();
+  assert.equal(b.choices[0].finish_reason, 'stop');
+});
+
+test('max_tokens: whitespace-only text never counts as "reached the limit"', async () => {
+  const j = await (await chat({ model: M, messages: msgs('#blankfirst'), max_tokens: 1 })).json();
+  assert.equal(j.choices[0].finish_reason, 'length');
+  assert.ok(j.choices[0].message.content.trim().length > 0);
 });
 
 test('max_tokens: above the reply length, or honorMaxTokens off → the whole reply, finish "stop"', async () => {

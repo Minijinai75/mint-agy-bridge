@@ -24,6 +24,8 @@ const TAG = `[${PLUGIN_ID}]`;
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 const MODELS_TTL_MS = 10 * 60 * 1000;
 const MODELS_RETRY_MS = 60 * 1000;
+const SMALL_MAX_TOKENS = 400;   // SillyTavern's default "max response length" is 300
+let warnedSmallMaxTokens = false;
 export const TESTED_AGY_VERSIONS = ['1.4.2'];
 
 function readOwnVersion() {
@@ -200,18 +202,26 @@ export async function handleChatCompletions(req, res) {
     const isStream = isObj && parsed.stream === true;   // OpenAI default is non-streaming
     if (!isObj || !Array.isArray(messages)) return sendJson(res, 400, errorBody('messages must be an array', 'invalid_request'));
     const maxTokens = requestMaxTokens(parsed);
+    // Failures of a non-streaming request go out as HTTP 200 + {"error":…}: SillyTavern's backend passes
+    // only the status text ("Bad Gateway") of a non-2xx non-streaming reply to the browser, so the
+    // readable message would be lost. Streaming failures keep their real status (SillyTavern forwards the body).
+    const fail = (code, message, type) => sendJson(res, isStream ? code : 200, errorBody(message, type));
+    if (maxTokens && maxTokens <= SMALL_MAX_TOKENS && !warnedSmallMaxTokens) {
+      warnedSmallMaxTokens = true;
+      console.warn(`${TAG} 酒館送來的最大回覆長度是 ${maxTokens} token，回覆會在這附近被切掉（0.1.1 起照這個設定停）。嫌短就把酒館「最大回覆長度」調大，或在 config.json 設 honorMaxTokens: false。`);
+    }
     if (ticket.aborted) return;
 
     // Which model: the request's → config.defaultModel → the first one agy lists.
     modelId = (typeof requestModel === 'string' && requestModel.trim()) || cfg.defaultModel || '';
     let list = await listModels();
     if (!modelId) modelId = list[0]?.id || '';
-    if (!modelId) return sendJson(res, 503, errorBody(`還拿不到 agy 的模型清單，沒辦法挑預設模型。${models.error || ''}`));
+    if (!modelId) return fail(503, `還拿不到 agy 的模型清單，沒辦法挑預設模型。${models.error || ''}`);
     if (list.length && !list.some(m => m.id === modelId)) {
       list = await listModels({ refresh: true });   // maybe the player signed in differently since
       if (list.length && !list.some(m => m.id === modelId)) {
         const msg = `模型「${modelId}」不在你 agy 帳號的清單裡（每個帳號、每種登入方式看到的模型不同）。現在能用的：${list.map(m => m.id).join('、')}。在酒館重新整理模型清單再選一次。`;
-        return sendJson(res, 400, errorBody(msg, 'invalid_request'));
+        return fail(400, msg, 'invalid_request');
       }
     }
     if (ticket.aborted) return;
@@ -248,7 +258,7 @@ export async function handleChatCompletions(req, res) {
     if (running.get(ticket.chatKey) !== ticket) releaseChat(ticket.chatKey, '新請求進來');
     const others = [...running.keys()].filter(k => k !== ticket.chatKey).length;
     if (others >= cfg.maxConcurrent) {
-      return sendJson(res, 429, errorBody(`同時在生的已經有 ${others} 則（上限 maxConcurrent=${cfg.maxConcurrent}），等前面的生完再送。`, 'rate_limit'));
+      return fail(429, `同時在生的已經有 ${others} 則（上限 maxConcurrent=${cfg.maxConcurrent}），等前面的生完再送。`, 'rate_limit');
     }
     running.set(ticket.chatKey, ticket);
 
@@ -308,7 +318,7 @@ export async function handleChatCompletions(req, res) {
     if (ticket.aborted) return replySuperseded(res, isStream, completionId, modelId);
 
     const errText = r.ok ? null : humanError(r.error, { timedOut: r.timedOut, contentBlocked: r.contentBlocked, timeoutSec: cfg.printTimeoutSec, elapsedSec: Math.round(r.ms / 1000) });
-    if (!r.ok && !sentText) return sendJson(res, 502, errorBody(`薄荷橋：${errText}`));
+    if (!r.ok && !sentText) return fail(502, `薄荷橋：${errText}`);
     if (!isStream) return replyWhole(res, false, completionId, modelId, r.text, r.usage, r.finishReason);
     // Part of the reply already went out: keep it, and send the error as an error event (red notice).
     if (!r.ok) writeStreamError(res, `薄荷橋：${errText}`);
@@ -334,7 +344,7 @@ export async function handleChatCompletions(req, res) {
 
 /** Superseded by a newer request in the same chat: close this one cleanly so the client is not left hanging. */
 function replySuperseded(res, isStream, id, model) {
-  if (!res.headersSent || !isStream) return sendJson(res, 409, errorBody('這一則被同一段對話的新請求取代了（重新生成或又送了一句）。', 'superseded'));
+  if (!res.headersSent || !isStream) return sendJson(res, isStream ? 409 : 200, errorBody('這一則被同一段對話的新請求取代了（重新生成或又送了一句）。', 'superseded'));
   res.write(`data: ${JSON.stringify(makeChunk(id, model, {}, 'length'))}\n\n`);
   res.write('data: [DONE]\n\n');
   res.end();

@@ -149,6 +149,9 @@ test('estimateTokens: measured ratios (CJK ~1.15 chars/token, Latin ~4.4 chars/t
   assert.ok(cjk > 690 && cjk < 770, String(cjk));
   const en = estimateTokens('x'.repeat(3675));                     // real reply: 3675 chars → 806 tokens
   assert.ok(en > 760 && en < 860, String(en));
+  // full-width punctuation common in Chinese roleplay counts like CJK; an emoji counts as one token
+  assert.equal(estimateTokens('“…”—'.repeat(25)), estimateTokens('狐'.repeat(100)));
+  assert.equal(estimateTokens('\u{1F600}'), 1);
 });
 
 test('config: printTimeoutSec defaults to 900; honorMaxTokens is on and runtime-patchable', () => {

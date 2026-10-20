@@ -11,7 +11,9 @@
 //   #filter0    → the same, before any text
 //   #hang       → print nothing and hang (ignores --print-timeout, like the case reported on 26-10-20)
 //   #exit1      → exit with code 1, nothing on stderr, no result line
-//   #long       → stream ~600 CJK characters (for max_tokens)
+//   #long       → stream 780 CJK characters (for max_tokens); with #stall, hang 20 s before finishing
+//   #quote      → a normal reply whose text quotes the filter sentence (must not count as filtered)
+//   #blankfirst → first piece is only a newline, then normal text
 //   otherwise  → reply "echo:<message>|agent=<bytes of agent file>|tail=<last 40 chars of agent file>"
 // FAKE_AGY_DATA (env) = agy data dir; the fake writes conversations/<id>.db and brain/<id>/ there.
 import fs from 'node:fs';
@@ -86,6 +88,7 @@ process.stdin.on('end', async () => {
       out({ event: 'step_update', step_update: { conversation_id: id, step_index: 2, state: 'ACTIVE', step_type: 'agent_response', text_delta: '狐狸在雪地裡慢慢走著回家。' } });
       await sleep(5);
     }
+    if (msg.includes('#stall')) await sleep(20000);
     out({ event: 'step_update', step_update: { conversation_id: id, step_index: 2, state: 'DONE', step_type: 'agent_response', text_delta: '', usage: { input_tokens: 100, output_tokens: 700 } } });
     out({ event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: '', usage: { input_tokens: 100, output_tokens: 700 } } });
     process.exit(0);
@@ -96,6 +99,14 @@ process.stdin.on('end', async () => {
   }
   if (msg.includes('#tool')) out({ event: 'step_update', step_update: { conversation_id: id, step_index: 1, state: 'DONE', step_type: 'run_command' } });
 
+  if (msg.includes('#quote')) {
+    const q = 'The guard read the notice aloud: "blocked by content safety filters" under the Generative AI Prohibited Use policy.';
+    for (const piece of q.match(/[\s\S]{1,20}/g)) out({ event: 'step_update', step_update: { conversation_id: id, step_index: 2, state: 'ACTIVE', step_type: 'agent_response', text_delta: piece } });
+    out({ event: 'step_update', step_update: { conversation_id: id, step_index: 2, state: 'DONE', step_type: 'agent_response', text_delta: '', usage: { input_tokens: 1, output_tokens: 30 } } });
+    out({ event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: q, usage: { input_tokens: 1, output_tokens: 30 } } });
+    process.exit(0);
+  }
+  if (msg.includes('#blankfirst')) out({ event: 'step_update', step_update: { conversation_id: id, step_index: 2, state: 'ACTIVE', step_type: 'agent_response', text_delta: '\n' } });
   const reply = `echo:${msg.slice(0, 200)}|agent=${Buffer.byteLength(agentText)}|tail=${agentText.trimEnd().slice(-40)}`;
   const pieces = reply.match(/[\s\S]{1,12}/g);
   const delay = msg.includes('#slow') ? Math.ceil(1500 / pieces.length) : 0;
