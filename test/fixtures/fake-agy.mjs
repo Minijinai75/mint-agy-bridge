@@ -6,7 +6,13 @@
 //   #midfail    → stream some text, then fail with a network error (exit 3)
 //   #nonl       → the final result line has no trailing newline and reports a denied action
 //   #grandchild → leave a sleeping grandchild that keeps stdout open after agy exits
-//   otherwise   → reply "echo:<message>|agent=<bytes of agent file>|tail=<last 40 chars of agent file>"
+//   #filter     → stream some text, then print Google's content-filter message on stderr and hang
+//                 (real agy retries the blocked reply until its timeout)
+//   #filter0    → the same, before any text
+//   #hang       → print nothing and hang (ignores --print-timeout, like the case reported on 26-10-20)
+//   #exit1      → exit with code 1, nothing on stderr, no result line
+//   #long       → stream ~600 CJK characters (for max_tokens)
+//   otherwise  → reply "echo:<message>|agent=<bytes of agent file>|tail=<last 40 chars of agent file>"
 // FAKE_AGY_DATA (env) = agy data dir; the fake writes conversations/<id>.db and brain/<id>/ there.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -63,6 +69,26 @@ process.stdin.on('end', async () => {
     await sleep(100);
     process.stderr.write('AGY_ERROR: {"short_error":"dial tcp 142.250.0.1:443: connectex: No connection could be made because the target machine actively refused it.","retryable":true}\n');
     process.exit(3);
+  }
+  if (msg.includes('#filter')) {
+    if (!msg.includes('#filter0')) {
+      out({ event: 'step_update', step_update: { conversation_id: id, step_index: 2, state: 'ACTIVE', step_type: 'agent_response', text_delta: '正文寫完了。' } });
+      await sleep(100);
+    }
+    process.stderr.write('W1020 retry.go:88] Your previous response was blocked by content safety filters: The model output could not be generated. This output contains sensitive words that violate Google\'s Generative AI Prohibited Use policy. If you think this was an error, send feedback.\nPlease provide a response that complies with content policies, or briefly explain to the user why you cannot help with this request\nRetries remaining: 3\n');
+    await sleep(20000);
+    process.exit(1);
+  }
+  if (msg.includes('#hang')) { await sleep(20000); process.exit(0); }
+  if (msg.includes('#exit1')) process.exit(1);
+  if (msg.includes('#long')) {
+    for (let i = 0; i < 60; i++) {
+      out({ event: 'step_update', step_update: { conversation_id: id, step_index: 2, state: 'ACTIVE', step_type: 'agent_response', text_delta: '狐狸在雪地裡慢慢走著回家。' } });
+      await sleep(5);
+    }
+    out({ event: 'step_update', step_update: { conversation_id: id, step_index: 2, state: 'DONE', step_type: 'agent_response', text_delta: '', usage: { input_tokens: 100, output_tokens: 700 } } });
+    out({ event: 'result', result: { conversation_id: id, status: 'SUCCESS', response: '', usage: { input_tokens: 100, output_tokens: 700 } } });
+    process.exit(0);
   }
   if (msg.includes('#grandchild')) {
     const { spawn } = await import('node:child_process');

@@ -43,6 +43,22 @@ tools: []
 
 agy 遇到 429 會自己重試約 140 秒才放棄（exit code 3，stderr 一行 `AGY_ERROR: {...}`）。環境變數 `AGY_CLI_MODEL_API_MAX_RETRIES=0` 實測 8 秒就回，錯誤裡帶 `retryable:false`。橋預設 0，想讓 agy 多撐幾次就調 `maxRetries`。
 
+## 內容過濾（0.1.1）
+
+Google 擋下輸出時，agy 不是回錯誤，而是在 stderr 印「Your previous response was blocked by content safety filters … Generative AI Prohibited Use policy … Retries remaining: 3」，再把這句當提示叫模型重寫。這是 agy 自己的另一層重試，`AGY_CLI_MODEL_API_MAX_RETRIES=0` 管不到它，`agy --help` 也沒有關它的選項；同一段內容通常每次都被擋，結果一路等到逾時，0.1.0 因此把它報成逾時（玩家回報：900 秒後才出錯）。0.1.1 在 stderr 和 agy 的非回覆事件裡看到這句就立刻停掉 agy，錯誤歸「被內容過濾擋下」。模型自己寫出來的字（回覆步驟）不比對，免得劇情裡引用到這句也被當成過濾。最常被擋的是 Horae 的劇情摘要請求（要模型把整段劇情重述一遍）。
+
+## 逾時與結束代碼（0.1.1）
+
+`--print-timeout` 到了 agy 不一定自己停（玩家回報的那發就沒停），所以橋另外有一個計時器，在 `printTimeoutSec + 30` 秒時連子程序一起砍。在 Windows 上 `taskkill /F` 會讓 agy 的結束代碼變成 1——0.1.0 把這個代碼當原始錯誤附上，看起來像 agy 壞了。0.1.1 被橋砍掉的那發只說「橋在 N 秒時停掉了 agy」，不再附結束代碼；agy 自己結束、stderr 又沒留話時，才說「agy 自己中途結束了（代碼 N）」。預設上限從 300 秒調到 900 秒：實測 `argon-medium` 配 4 萬 token 歷史，每秒約 13 個 token，4,400 token 的回覆就要 5 分半。
+
+## 最大回覆長度（0.1.1）
+
+agy 1.4.2 沒有輸出上限的選項；代理檔前置資料寫 `maxOutputTokens: 40` 實測照樣生出 806 token，它不認。所以橋邊收邊估：中文類字元約 1.15 字一個 token、其他字元約 4.4 個一個 token（實測 gemini-3.8-flash：中文 863 字＝729 token、英文 3,675 字元＝806 token），估到請求的 `max_tokens`（或 `max_completion_tokens`）就停掉 agy，以 `finish_reason: length` 正常收尾，已經生出的字是一則完整的回覆。推理 token 不算。`honorMaxTokens: false` 可以關掉。
+
+## 串流中途的錯誤（0.1.1）
+
+0.1.0 把錯誤接在回覆文字後面（`[薄荷橋：…]`），玩家回報它出現在酒館的「思考」區——文字一旦進了回覆，就會被酒館的推理自動解析或正規表達式腳本當成內容處理。0.1.1 改送一個獨立的 `data: {"error":{"message":…}}` 事件：酒館的串流解析（`tryParseStreamingError`）會跳紅色通知，這個事件沒有 `choices`，不會加進回覆；已經生出的字照樣留著。
+
 ## 本機留下的東西
 
 每一發 agy 會在 `~/.gemini/antigravity-cli/` 留下：`conversations/<對話ID>.db`（約 400 KB）、`brain/<對話ID>/`（含完整逐字稿）、`annotations/<對話ID>.pbtxt`、`presence/<對話ID>.lock`。橋生完就刪這四樣（只刪 UUID 格式、跟這一發 init 事件對得上的那幾個檔；刪 0 個或刪失敗會在主控台警告）。

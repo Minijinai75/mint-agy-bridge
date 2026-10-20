@@ -13,7 +13,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mint-test-'));
 const dataDir = path.join(tmp, 'agydata');
 const ws = path.join(tmp, 'ws');
 const argsOut = path.join(tmp, 'args.json');
-const BASE_CFG = { host: '127.0.0.1', apiKey: '', agyPath: path.join(here, 'fixtures', 'fake-agy.mjs'), agyDataDir: dataDir, usageLog: false, framing: 'FRAME', stdinLimitBytes: 180000, maxRetries: 0, keepOnDisconnect: true, maxConcurrent: 2, printTimeoutSec: 300 };
+const BASE_CFG = { host: '127.0.0.1', apiKey: '', agyPath: path.join(here, 'fixtures', 'fake-agy.mjs'), agyDataDir: dataDir, usageLog: false, framing: 'FRAME', stdinLimitBytes: 180000, maxRetries: 0, keepOnDisconnect: true, maxConcurrent: 2, printTimeoutSec: 300, watchdogExtraSec: 30, honorMaxTokens: true };
 let server, base;
 
 before(async () => {
@@ -34,15 +34,17 @@ const chat = (body, extra = {}) => fetch(`${base}/v1/chat/completions`, { method
 async function sseText(res) {
   const raw = await res.text();
   let text = '', finish = null, done = false;
+  const errors = [];
   for (const line of raw.split('\n')) {
     if (!line.startsWith('data: ')) continue;
     const d = line.slice(6);
     if (d === '[DONE]') { done = true; continue; }
     const j = JSON.parse(d);
+    if (j.error) { errors.push(j.error.message); continue; }
     text += j.choices[0].delta.content || '';
     finish = j.choices[0].finish_reason || finish;
   }
-  return { text, finish, done, raw };
+  return { text, finish, done, errors, raw };
 }
 const msgs = (latest, card = 'CARD-起') => [{ role: 'system', content: card }, { role: 'assistant', content: '歡迎光臨' }, { role: 'user', content: latest }];
 const agentFilesLeft = () => fs.readdirSync(path.join(ws, '.agents', 'agents')).length;
@@ -99,11 +101,72 @@ test('429 before any text → HTTP 502 with a readable message (stream and json)
   }
 });
 
-test('failure after text started → partial text kept, error appended, stream closed', async () => {
+test('failure after text started → partial text kept, error sent as an error event (not reply text), stream closed', async () => {
   const s = await sseText(await chat({ model: M, messages: msgs('#midfail'), stream: true }));
-  assert.ok(s.text.startsWith('前半段'));
-  assert.match(s.text, /\[薄荷橋：連不上 Google/);
+  assert.equal(s.text, '前半段');
+  assert.equal(s.errors.length, 1);
+  assert.match(s.errors[0], /^薄荷橋：連不上 Google/);
   assert.ok(s.done);
+});
+
+// ── 0.1.1: content filter, timeout wording, exit code, max_tokens ─────────
+test('content filter after text → agy stopped at once, text kept, error event says filter (not timeout)', async () => {
+  const t0 = Date.now();
+  const s = await sseText(await chat({ model: M, messages: msgs('#filter'), stream: true }));
+  assert.ok(Date.now() - t0 < 8000, `took ${Date.now() - t0} ms (fake agy hangs 20 s)`);
+  assert.equal(s.text, '正文寫完了。');
+  assert.equal(s.errors.length, 1);
+  assert.match(s.errors[0], /內容過濾擋下/);
+  assert.doesNotMatch(s.errors[0], /秒時停掉/);
+  assert.match(s.errors[0], /content safety filters[\s\S]*Retries remaining: 3/);
+  assert.equal(_state().lastTurn.contentBlocked, true);
+});
+
+test('content filter before any text → HTTP 502 with the filter message, quickly (stream and json)', async () => {
+  for (const stream of [true, false]) {
+    const t0 = Date.now();
+    const res = await chat({ model: M, messages: msgs('#filter0'), stream });
+    assert.equal(res.status, 502);
+    assert.match((await res.json()).error.message, /薄荷橋：被 Google 的內容過濾擋下了/);
+    assert.ok(Date.now() - t0 < 8000, `took ${Date.now() - t0} ms`);
+  }
+});
+
+test('bridge timeout → says the bridge stopped agy after N s; no misleading "exited with code"', async () => {
+  _setConfig({ printTimeoutSec: 1, watchdogExtraSec: 0 });
+  const res = await chat({ model: M, messages: msgs('#hang'), stream: true });
+  assert.equal(res.status, 502);
+  const m = (await res.json()).error.message;
+  assert.match(m, /橋在 \d+ 秒時停掉了 agy/);
+  assert.doesNotMatch(m, /exited with code/);
+  assert.equal(_state().lastTurn.timedOut, true);
+});
+
+test('agy exits with code 1 and says nothing → its own readable message, not the timeout one', async () => {
+  const res = await chat({ model: M, messages: msgs('#exit1') });
+  assert.equal(res.status, 502);
+  const m = (await res.json()).error.message;
+  assert.match(m, /agy 自己中途結束了（代碼 1）/);
+  assert.doesNotMatch(m, /停掉了 agy/);
+});
+
+test('max_tokens: long reply is stopped near the limit with finish_reason "length" (stream and json)', async () => {
+  const s = await sseText(await chat({ model: M, messages: msgs('#long'), stream: true, max_tokens: 50 }));
+  assert.equal(s.finish, 'length'); assert.ok(s.done); assert.deepEqual(s.errors, []);
+  assert.ok(s.text.length >= 50 && s.text.length < 80, `got ${s.text.length} chars`);
+  assert.equal(_state().lastTurn.capped, true);
+  const j = await (await chat({ model: M, messages: msgs('#long'), max_tokens: 50 })).json();
+  assert.equal(j.choices[0].finish_reason, 'length');
+  assert.ok(j.choices[0].message.content.length < 80);
+});
+
+test('max_tokens: above the reply length, or honorMaxTokens off → the whole reply, finish "stop"', async () => {
+  const s = await sseText(await chat({ model: M, messages: msgs('#long'), stream: true, max_tokens: 4000 }));
+  assert.equal(s.finish, 'stop'); assert.equal(s.text.length, 60 * 13);
+  _setConfig({ honorMaxTokens: false });
+  const j = await (await chat({ model: M, messages: msgs('#long'), max_tokens: 50 })).json();
+  assert.equal(j.choices[0].finish_reason, 'stop');
+  assert.equal(j.choices[0].message.content.length, 60 * 13);
 });
 
 test('oversized latest message goes into the agent file; stdin only gets the pointer', async () => {

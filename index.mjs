@@ -125,6 +125,25 @@ function sendJson(res, code, obj) {
 }
 const errorBody = (message, type = 'server_error') => ({ error: { message, type } });
 
+/**
+ * An error after the stream has started. Sent as its own `{"error":…}` event, never as reply text:
+ * SillyTavern shows it as a red notice and keeps it out of the message (text appended to the reply
+ * could land in the "thinking" box through reasoning auto-parse, or be saved as part of the story).
+ */
+function writeStreamError(res, message) {
+  res.write(`data: ${JSON.stringify(errorBody(message))}\n\n`);
+}
+
+/** max_tokens / max_completion_tokens from the request, when the bridge should honour it. */
+function requestMaxTokens(body) {
+  if (!cfg.honorMaxTokens) return 0;
+  for (const k of ['max_completion_tokens', 'max_tokens']) {
+    const v = body[k];
+    if (Number.isInteger(v) && v > 0) return v;
+  }
+  return 0;
+}
+
 function makeChunk(id, model, delta, finishReason) {
   return { id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, delta, finish_reason: finishReason }] };
 }
@@ -180,6 +199,7 @@ export async function handleChatCompletions(req, res) {
     const { messages, model: requestModel } = isObj ? parsed : {};
     const isStream = isObj && parsed.stream === true;   // OpenAI default is non-streaming
     if (!isObj || !Array.isArray(messages)) return sendJson(res, 400, errorBody('messages must be an array', 'invalid_request'));
+    const maxTokens = requestMaxTokens(parsed);
     if (ticket.aborted) return;
 
     // Which model: the request's → config.defaultModel → the first one agy lists.
@@ -221,7 +241,7 @@ export async function handleChatCompletions(req, res) {
       console.log(`${TAG}[${no}] ← 續盤，直接給存好的 ${resumed.text.length} 字`);
       if (running.get(ticket.chatKey) === ticket) running.delete(ticket.chatKey);
       if (!alive()) return;
-      return replyWhole(res, isStream, completionId, modelId, resumed.text, resumed.usage);
+      return replyWhole(res, isStream, completionId, modelId, resumed.text, resumed.usage, resumed.finishReason);
     }
 
     // ── take this chat's slot; other chats may run in parallel up to maxConcurrent
@@ -242,7 +262,7 @@ export async function handleChatCompletions(req, res) {
     if (ticket.aborted) return;   // SillyTavern left before agy started: nobody wants this one
 
     const no = ++requestCount;
-    const shape = `msgs=${messages.length} agentFile=${plan.bytes.agentFile}B stdin=${plan.bytes.stdin}B${plan.movedToAgentFile ? ' (最新一則太長，已移進代理檔)' : ''}${plan.continuation ? ' (接續寫)' : ''}${p.imageCount ? ` 圖${p.imageCount}張未帶` : ''}`;
+    const shape = `msgs=${messages.length} agentFile=${plan.bytes.agentFile}B stdin=${plan.bytes.stdin}B${maxTokens ? ` max_tokens=${maxTokens}` : ''}${plan.movedToAgentFile ? ' (最新一則太長，已移進代理檔)' : ''}${plan.continuation ? ' (接續寫)' : ''}${p.imageCount ? ` 圖${p.imageCount}張未帶` : ''}`;
     console.log(`${TAG}[${no}] → ${modelId} ${shape} ${isStream ? 'stream' : 'json'}`);
 
     // Streaming headers go out with the first piece of text, so an error before that can still be a
@@ -258,7 +278,7 @@ export async function handleChatCompletions(req, res) {
       res.write(`data: ${JSON.stringify(makeChunk(completionId, modelId, { content: t }, null))}\n\n`);
     };
 
-    ticket.handle = runTurn({ cfg, workspace, agentName, model: modelId, stdinText: plan.stdinText, logFile, onText: writeText });
+    ticket.handle = runTurn({ cfg, workspace, agentName, model: modelId, stdinText: plan.stdinText, logFile, maxTokens, onText: writeText });
     const r = await ticket.handle.done;
     ticket.result = r;
 
@@ -273,31 +293,34 @@ export async function handleChatCompletions(req, res) {
     const u = r.usage || {};
     const alarm = (r.unexpectedSteps.length || r.deniedActions) ? { unexpectedSteps: r.unexpectedSteps, deniedActions: r.deniedActions } : null;
     if (alarm) console.warn(`${TAG}[${no}] ⚠ agy 出現非對話步驟或被拒動作：${JSON.stringify(alarm).slice(0, 400)}`);
-    console.log(`${TAG}[${no}] ← ${r.ok ? 'ok' : 'fail'}${ticket.aborted ? '(讓位／停止)' : ticket.orphaned ? '(斷線後生完)' : ''} in=${u.input_tokens ?? 'n/a'} out=${u.output_tokens ?? 'n/a'} think=${u.thinking_tokens ?? 'n/a'} cacheR=${u.cache_read_tokens ?? 'n/a'} ttft=${r.ttftMs ?? 'n/a'}ms total=${r.ms}ms exit=${r.exitCode}`);
+    const stopNote = r.capped ? `(到 max_tokens=${maxTokens} 收尾)` : r.contentBlocked ? '(內容過濾擋下，已停)' : r.timedOut ? '(逾時，橋停掉)' : '';
+    console.log(`${TAG}[${no}] ← ${r.ok ? 'ok' : 'fail'}${stopNote}${ticket.aborted ? '(讓位／停止)' : ticket.orphaned ? '(斷線後生完)' : ''} in=${u.input_tokens ?? 'n/a'} out=${u.output_tokens ?? 'n/a'} think=${u.thinking_tokens ?? 'n/a'} cacheR=${u.cache_read_tokens ?? 'n/a'} ttft=${r.ttftMs ?? 'n/a'}ms total=${r.ms}ms exit=${r.exitCode}`);
     if (!r.ok && !ticket.aborted) console.error(`${TAG}[${no}] error: ${String(r.error?.message || r.error).slice(0, 500)}`);
-    lastTurn = { model: modelId, ok: r.ok, usage: r.usage, ttftMs: r.ttftMs, ms: r.ms, at: new Date().toISOString(), movedToAgentFile: plan.movedToAgentFile, ...(alarm ? { alarm } : {}) };
-    appendUsageLog({ t: lastTurn.at, n: no, model: modelId, ok: r.ok, aborted: ticket.aborted, orphaned: ticket.orphaned, usage: r.usage, ttftMs: r.ttftMs, ms: r.ms, agentFileBytes: plan.bytes.agentFile, stdinBytes: plan.bytes.stdin, movedToAgentFile: plan.movedToAgentFile, continuation: plan.continuation, msgs: messages.length, ...(alarm ? { alarm } : {}) });
+    const stop = { maxTokens: maxTokens || null, capped: r.capped, contentBlocked: r.contentBlocked, timedOut: r.timedOut, exitCode: r.exitCode, ...(r.ok ? {} : { error: String(r.error?.message || r.error || '').slice(0, 300) }) };
+    lastTurn = { model: modelId, ok: r.ok, usage: r.usage, ttftMs: r.ttftMs, ms: r.ms, at: new Date().toISOString(), movedToAgentFile: plan.movedToAgentFile, ...stop, ...(alarm ? { alarm } : {}) };
+    appendUsageLog({ t: lastTurn.at, n: no, model: modelId, ok: r.ok, aborted: ticket.aborted, orphaned: ticket.orphaned, maxTokens: maxTokens || null, capped: r.capped, contentBlocked: r.contentBlocked, timedOut: r.timedOut, usage: r.usage, ttftMs: r.ttftMs, ms: r.ms, agentFileBytes: plan.bytes.agentFile, stdinBytes: plan.bytes.stdin, movedToAgentFile: plan.movedToAgentFile, continuation: plan.continuation, msgs: messages.length, ...(alarm ? { alarm } : {}) });
 
     if (ticket.orphaned && !ticket.aborted && r.ok) {
-      resumeStore.set(ticket.fp, { ok: true, text: r.text, usage: r.usage, at: Date.now() });
+      resumeStore.set(ticket.fp, { ok: true, text: r.text, usage: r.usage, finishReason: r.finishReason, at: Date.now() });
       console.log(`${TAG}[${no}] 斷線那則已存好 ${r.text.length} 字，等重新生成來拿`);
     }
     if (!alive()) return;
     if (ticket.aborted) return replySuperseded(res, isStream, completionId, modelId);
 
-    const errText = r.ok ? null : humanError(r.error, { timedOut: r.timedOut, timeoutSec: cfg.printTimeoutSec });
+    const errText = r.ok ? null : humanError(r.error, { timedOut: r.timedOut, contentBlocked: r.contentBlocked, timeoutSec: cfg.printTimeoutSec, elapsedSec: Math.round(r.ms / 1000) });
     if (!r.ok && !sentText) return sendJson(res, 502, errorBody(`薄荷橋：${errText}`));
-    if (!isStream) return replyWhole(res, false, completionId, modelId, r.text, r.usage);
-    if (!r.ok) res.write(`data: ${JSON.stringify(makeChunk(completionId, modelId, { content: `\n\n[薄荷橋：${errText}]` }, null))}\n\n`);
-    else if (!sentText) return replyWhole(res, true, completionId, modelId, r.text, r.usage);
-    res.write(`data: ${JSON.stringify(makeChunk(completionId, modelId, {}, 'stop'))}\n\n`);
+    if (!isStream) return replyWhole(res, false, completionId, modelId, r.text, r.usage, r.finishReason);
+    // Part of the reply already went out: keep it, and send the error as an error event (red notice).
+    if (!r.ok) writeStreamError(res, `薄荷橋：${errText}`);
+    else if (!sentText) return replyWhole(res, true, completionId, modelId, r.text, r.usage, r.finishReason);
+    res.write(`data: ${JSON.stringify(makeChunk(completionId, modelId, {}, r.ok ? r.finishReason : 'stop'))}\n\n`);
     res.write('data: [DONE]\n\n');
     res.end();
   } catch (err) {
     console.error(`${TAG} 拋錯：${String(err?.stack || err).slice(0, 600)}`);
     if (!res.headersSent) sendJson(res, 500, errorBody(`薄荷橋：${humanError(err)}`));
     else if (alive()) {
-      res.write(`data: ${JSON.stringify(makeChunk(completionId, modelId, { content: `\n\n[薄荷橋：${humanError(err)}]` }, null))}\n\n`);
+      writeStreamError(res, `薄荷橋：${humanError(err)}`);
       res.write('data: [DONE]\n\n'); res.end();
     }
   } finally {
@@ -317,19 +340,19 @@ function replySuperseded(res, isStream, id, model) {
   res.end();
 }
 
-function replyWhole(res, isStream, id, model, text, usage) {
+function replyWhole(res, isStream, id, model, text, usage, finishReason = 'stop') {
   const u = usage || {};
   if (!isStream) {
     return sendJson(res, 200, {
       id, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
-      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: finishReason }],
       usage: { prompt_tokens: u.input_tokens ?? 0, completion_tokens: u.output_tokens ?? 0, total_tokens: (u.input_tokens ?? 0) + (u.output_tokens ?? 0) },
     });
   }
   if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
   res.write(`data: ${JSON.stringify(makeChunk(id, model, { role: 'assistant', content: '' }, null))}\n\n`);
   res.write(`data: ${JSON.stringify(makeChunk(id, model, { content: text }, null))}\n\n`);
-  res.write(`data: ${JSON.stringify(makeChunk(id, model, {}, 'stop'))}\n\n`);
+  res.write(`data: ${JSON.stringify(makeChunk(id, model, {}, finishReason))}\n\n`);
   res.write('data: [DONE]\n\n');
   res.end();
 }

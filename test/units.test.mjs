@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { planTurn, renderAgentFile, agentNameFor, LONG_MESSAGE_POINTER, CONTINUE_POINTER, CONTINUE_INSTRUCTION, BODY_MARKER, stdinLine } from '../lib/agent-file.mjs';
 import { humanError, parseAgyError } from '../lib/errors.mjs';
-import { parseModelList } from '../lib/agy.mjs';
+import { parseModelList, estimateTokens, CONTENT_FILTER_RE } from '../lib/agy.mjs';
 import { loadConfig, applyRuntimePatch, publicConfig, DEFAULTS } from '../lib/config.mjs';
 
 const sys = c => ({ role: 'system', content: c });
@@ -121,6 +121,41 @@ test('humanError: missing agy, timeout, credits, generic 429, refusal before aut
   assert.match(humanError('Unauthorized: response blocked by safety filters'), /依內容擋下/);
   assert.match(humanError('UNAUTHENTICATED: please sign in'), /還沒登入/);
   assert.equal(humanError('something else'), 'something else');
+});
+
+// 0.1.1 — wording reported from real play on 26-10-20 (agy 1.4.2, gemini-4-argon-medium)
+const FILTER_TEXT = "Your previous response was blocked by content safety filters: The model output could not be generated. This output contains sensitive words that violate Google's Generative AI Prohibited Use policy. If you think this was an error, send feedback.\nPlease provide a response that complies with content policies, or briefly explain to the user why you cannot help with this request\nRetries remaining: 3";
+
+test('humanError: content filter wins over timeout (0.1.0 called it a timeout)', () => {
+  assert.ok(CONTENT_FILTER_RE.test(FILTER_TEXT));
+  for (const ctx of [{}, { timedOut: true, timeoutSec: 900 }, { contentBlocked: true }]) {
+    const h = humanError(FILTER_TEXT, ctx);
+    assert.match(h, /內容過濾擋下/); assert.match(h, /Horae/);
+    assert.doesNotMatch(h, /停掉了 agy/);
+  }
+});
+
+test('humanError: bridge timeout says the bridge stopped agy; a bare exit code gets its own sentence', () => {
+  const t = humanError('bridge stopped agy after 930 s without a finished reply', { timedOut: true, timeoutSec: 900, elapsedSec: 930 });
+  assert.match(t, /橋在 930 秒時停掉了 agy/); assert.match(t, /上限是 900 秒/); assert.match(t, /argon-high/);
+  const e = humanError('agy exited with code 1');
+  assert.match(e, /agy 自己中途結束了（代碼 1）/); assert.match(e, /\/status/);
+  assert.doesNotMatch(e, /停掉了 agy/);
+});
+
+test('estimateTokens: measured ratios (CJK ~1.15 chars/token, Latin ~4.4 chars/token)', () => {
+  assert.equal(estimateTokens(''), 0);
+  const cjk = estimateTokens('狐'.repeat(836) + 'a'.repeat(27));   // real reply: 863 chars → 729 tokens
+  assert.ok(cjk > 690 && cjk < 770, String(cjk));
+  const en = estimateTokens('x'.repeat(3675));                     // real reply: 3675 chars → 806 tokens
+  assert.ok(en > 760 && en < 860, String(en));
+});
+
+test('config: printTimeoutSec defaults to 900; honorMaxTokens is on and runtime-patchable', () => {
+  assert.equal(DEFAULTS.printTimeoutSec, 900);
+  assert.equal(DEFAULTS.honorMaxTokens, true);
+  assert.equal(applyRuntimePatch({ ...DEFAULTS }, { honorMaxTokens: false }).honorMaxTokens, false);
+  assert.ok(!('watchdogExtraSec' in DEFAULTS), 'test-only knob is not a config key');
 });
 
 test('parseAgyError reads the AGY_ERROR line', () => {
