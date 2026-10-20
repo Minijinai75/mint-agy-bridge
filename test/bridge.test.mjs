@@ -6,14 +6,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createServer, _setConfig, _setWorkspace, _setModels, _state } from '../index.mjs';
+import { createServer, _setConfig, _setWorkspace, _setModels, _state, STALL_RETRY_NOTE } from '../index.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mint-test-'));
 const dataDir = path.join(tmp, 'agydata');
 const ws = path.join(tmp, 'ws');
 const argsOut = path.join(tmp, 'args.json');
-const BASE_CFG = { host: '127.0.0.1', apiKey: '', agyPath: path.join(here, 'fixtures', 'fake-agy.mjs'), agyDataDir: dataDir, usageLog: false, framing: 'FRAME', stdinLimitBytes: 180000, maxRetries: 0, keepOnDisconnect: true, maxConcurrent: 2, printTimeoutSec: 300, watchdogExtraSec: 30, honorMaxTokens: true };
+const keptDir = path.join(tmp, 'kept-logs');
+const BASE_CFG = { host: '127.0.0.1', apiKey: '', agyPath: path.join(here, 'fixtures', 'fake-agy.mjs'), agyDataDir: dataDir, usageLog: false, framing: 'FRAME', stdinLimitBytes: 180000, maxRetries: 0, keepOnDisconnect: true, maxConcurrent: 2, printTimeoutSec: 300, watchdogExtraSec: 30, honorMaxTokens: true, stallSec: 120, stallRetry: true, statusRecheckMs: 5000, doneGraceMs: 5000, stallFirstSec: 180, keptLogsDir: keptDir, cleanupRetryMs: 300 };
 let server, base;
 
 before(async () => {
@@ -27,10 +28,31 @@ before(async () => {
   base = `http://127.0.0.1:${server.address().port}`;
 });
 beforeEach(() => { _setConfig(BASE_CFG); });
-after(() => { server.close(); fs.rmSync(tmp, { recursive: true, force: true }); });
+// Windows: a fake agy killed a moment ago may still hold its working folder, so retry the removal for a while.
+// Removing the temp folder is housekeeping, not a test: Windows sometimes keeps it locked for a moment
+// after the last fake agy was killed (checked 26-10-20: no fake agy left running at that point).
+after(async () => {
+  server.close();
+  await sleep(1000);
+  try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 }); }
+  catch (err) { console.warn(`(temp folder left behind: ${err.code} ${tmp})`); }
+});
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const chat = (body, extra = {}) => fetch(`${base}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', ...(extra.headers || {}) }, body: JSON.stringify(body), signal: extra.signal });
+// The bridge answers as soon as the reply is complete and tidies up (status, files) once agy has exited,
+// so after reading a body the tests wait for that tidy-up before looking at files or lastTurn.
+async function settle(maxMs = 1500) {
+  const t0 = Date.now();
+  while (_state().busy > 0 && Date.now() - t0 < maxMs) await sleep(20);
+  await sleep(20);
+}
+const chat = async (body, extra = {}) => {
+  const res = await fetch(`${base}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', ...(extra.headers || {}) }, body: JSON.stringify(body), signal: extra.signal });
+  const json = res.json.bind(res), text = res.text.bind(res);
+  res.json = async () => { const j = await json(); await settle(); return j; };
+  res.text = async () => { const t = await text(); await settle(); return t; };
+  return res;
+};
 async function sseText(res) {
   const raw = await res.text();
   let text = '', finish = null, done = false;
@@ -211,6 +233,7 @@ test('oversized latest message goes into the agent file; stdin only gets the poi
   const big = '長'.repeat(70000) + 'TAIL-MARK';
   const res = await chat({ model: M, messages: msgs(big) });
   assert.equal(res.status, 200);
+  await res.json();
   const seen = seenArgs();
   assert.ok(Buffer.byteLength(seen.msg) < 1000, 'stdin stayed small');
   assert.ok(seen.agentText.trimEnd().endsWith('TAIL-MARK\n</latest_message>'));
@@ -346,4 +369,163 @@ test('POST /config clamps values', async () => {
 test('bad requests', async () => {
   assert.equal((await fetch(`${base}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{nope' })).status, 400);
   assert.equal((await chat({ messages: 'x' })).status, 400);
+});
+
+// ── 0.1.2: stalled half-way, thinking blocks and max_tokens, agy looked up again ──
+const stallMark = () => path.join(dataDir, 'stalled-once');
+
+test('stall (stream): text stops for stallSec → agy stopped, sent again once; half kept, marked line, then the new reply', async () => {
+  fs.rmSync(stallMark(), { force: true });
+  _setConfig({ stallSec: 1 });
+  const t0 = Date.now();
+  const s = await sseText(await chat({ model: M, messages: msgs('#stallonce'), stream: true }));
+  assert.ok(Date.now() - t0 < 8000, `took ${Date.now() - t0} ms (fake agy goes silent for 20 s)`);
+  assert.equal(s.text, `前半段寫到一半${STALL_RETRY_NOTE}重來的回覆。`);
+  assert.equal(s.finish, 'stop'); assert.ok(s.done); assert.deepEqual(s.errors, []);
+  const lt = _state().lastTurn;
+  assert.equal(lt.ok, true); assert.equal(lt.retriedAfterStall, true); assert.equal(lt.stalled, false);
+  assert.equal(agentFilesLeft(), 0);
+  assert.deepEqual(fs.readdirSync(path.join(dataDir, 'conversations')), []);   // both runs cleaned up
+});
+
+test('stall (json): only the second run\'s reply, no half and no marker line', async () => {
+  fs.rmSync(stallMark(), { force: true });
+  _setConfig({ stallSec: 1 });
+  const j = await (await chat({ model: M, messages: msgs('#stallonce') })).json();
+  assert.equal(j.choices[0].message.content, '重來的回覆。');
+  assert.equal(j.choices[0].finish_reason, 'stop');
+});
+
+test('stall twice → only one retry; error event says the model went quiet for N s and that it was sent again', async () => {
+  _setConfig({ stallSec: 1 });
+  const t0 = Date.now();
+  const s = await sseText(await chat({ model: M, messages: msgs('#stallalways'), stream: true }));
+  assert.ok(Date.now() - t0 < 10000, `took ${Date.now() - t0} ms`);
+  assert.equal(s.text, `前半段寫到一半${STALL_RETRY_NOTE}前半段寫到一半`);
+  assert.equal(s.errors.length, 1);
+  assert.match(s.errors[0], /模型那頭 1 秒沒出字/); assert.match(s.errors[0], /重送過一次/);
+  assert.doesNotMatch(s.errors[0], /橋在 \d+ 秒時停掉了/);   // not the overall-timeout wording
+  const lt = _state().lastTurn;
+  assert.equal(lt.stalled, true); assert.equal(lt.retriedAfterStall, true);
+  assert.equal(lt.tokPerSec, null);   // text arrived over less than a second: no speed rather than an absurd one
+  fs.rmSync(stallMark(), { force: true });
+});
+
+test('stallRetry off → stopped once, no retry, no marker line', async () => {
+  _setConfig({ stallSec: 1, stallRetry: false });
+  const s = await sseText(await chat({ model: M, messages: msgs('#stallalways'), stream: true }));
+  assert.equal(s.text, '前半段寫到一半');
+  assert.match(s.errors[0], /模型那頭 1 秒沒出字/); assert.doesNotMatch(s.errors[0], /重送過一次/);
+  assert.equal(_state().lastTurn.retriedAfterStall, undefined);
+  fs.rmSync(stallMark(), { force: true });
+});
+
+test('slow but steady text is not a stall (gaps shorter than stallSec)', async () => {
+  _setConfig({ stallSec: 1 });
+  const s = await sseText(await chat({ model: M, messages: msgs('#slow'), stream: true }));
+  assert.match(s.text, /^echo:#slow/); assert.deepEqual(s.errors, []);
+  assert.equal(_state().lastTurn.stalled, false);
+});
+
+test('reply finished (DONE) but agy slow to exit → not a stall, no retry', async () => {
+  _setConfig({ stallSec: 1 });
+  const s = await sseText(await chat({ model: M, messages: msgs('#donehang'), stream: true }));
+  assert.equal(s.text, '完整的回覆。'); assert.deepEqual(s.errors, []); assert.equal(s.finish, 'stop');
+  assert.equal(_state().lastTurn.stalled, false); assert.equal(_state().lastTurn.retriedAfterStall, undefined);
+});
+
+test('reply complete but agy never exits → finished as a success within the grace, not at the timeout', async () => {
+  _setConfig({ doneGraceMs: 300 });
+  for (const stream of [true, false]) {
+    const t0 = Date.now();
+    const res = await chat({ model: M, messages: msgs('#donenoexit'), stream });
+    const text = stream ? (await sseText(res)) : (await res.json());
+    assert.ok(Date.now() - t0 < 4000, `took ${Date.now() - t0} ms (fake agy never exits)`);
+    if (stream) { assert.equal(text.text, '正文生完了。\n'); assert.equal(text.finish, 'stop'); assert.ok(text.done); assert.deepEqual(text.errors, []); }
+    else assert.equal(text.choices[0].message.content, '正文生完了。\n');
+    const lt = _state().lastTurn;
+    assert.equal(lt.ok, true); assert.equal(lt.lingered, true); assert.equal(lt.timedOut, false); assert.equal(lt.usage.output_tokens, 3961);
+    // agy's log of that run is kept (redacted), and agy's conversation files are gone
+    assert.match(lt.agyLog, /^logs\/.*_lingered\.log$/);
+    const kept = fs.readFileSync(path.join(keptDir, path.basename(lt.agyLog)), 'utf8');
+    assert.match(kept, /applyAuthResult/);
+    for (const secret of ['player@example.com', 'my-proj-123', 'Player']) assert.ok(!kept.includes(secret), `${secret} left in the kept log`);
+    assert.match(kept, /workspace ~.Secret Folder.ws/);   // another player's home folder becomes ~, the rest of the path stays
+    assert.deepEqual(fs.readdirSync(path.join(dataDir, 'conversations')), []);
+  }
+});
+
+test('the client is answered when the reply is complete, not when agy finally exits', async () => {
+  _setConfig({ doneGraceMs: 2500 });
+  const t0 = Date.now();
+  const res = await fetch(`${base}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: M, messages: msgs('#donenoexit'), stream: true }) });
+  const raw = await res.text();
+  assert.ok(Date.now() - t0 < 1500, `answered after ${Date.now() - t0} ms; agy is stopped only at 2.5 s`);
+  assert.match(raw, /data: \[DONE\]/);
+  await settle(5000);
+  assert.equal(_state().lastTurn.lingered, true);
+  assert.deepEqual(_state().resumeKeys, []);   // closing the stream ourselves is not a disconnect: nothing stored for "resume"
+});
+
+test('DONE without a result event and no exit: answered after the grace; telemetry says so (sawResult false, hang ≈ grace)', async () => {
+  _setConfig({ doneGraceMs: 400 });
+  const s = await sseText(await chat({ model: M, messages: msgs('#doneonly'), stream: true }));
+  assert.equal(s.text, '只有完成訊號。'); assert.equal(s.finish, 'stop'); assert.deepEqual(s.errors, []);
+  const lt = _state().lastTurn;
+  assert.equal(lt.ok, true); assert.equal(lt.lingered, true); assert.equal(lt.sawResult, false);
+  assert.ok(lt.postDoneHangSec >= 0.3 && lt.postDoneHangSec < 1.5, `postDoneHangSec ${lt.postDoneHangSec}`);
+});
+
+test('text after a DONE (a second reply step) is kept: the turn is not cut at the first DONE', async () => {
+  _setConfig({ doneGraceMs: 500 });   // shorter than the whole second step: the first DONE's timer must be called off
+  const s = await sseText(await chat({ model: M, messages: msgs('#twodone'), stream: true }));
+  assert.equal(s.text, '第一段。第二段。'); assert.equal(s.finish, 'stop'); assert.deepEqual(s.errors, []);
+  assert.equal(_state().lastTurn.textAfterDone, true); assert.equal(_state().lastTurn.lingered, undefined);
+});
+
+test('stall retry after a finished <think> block: the retry\'s own thinking is left out of the stream', async () => {
+  fs.rmSync(stallMark(), { force: true });
+  _setConfig({ stallSec: 1 });
+  const s = await sseText(await chat({ model: M, messages: msgs('#stallthink'), stream: true }));
+  assert.equal(s.text, `<think>想A</think>\n半截${STALL_RETRY_NOTE}全文。`);
+  assert.equal(s.errors.length, 0);
+});
+
+test('a thinking tag that never closes properly does not switch max_tokens off', async () => {
+  const s = await sseText(await chat({ model: M, messages: msgs('#mismatch'), stream: true, max_tokens: 100 }));
+  assert.equal(s.finish, 'length');
+  assert.equal(_state().lastTurn.capped, true);
+});
+
+test('silence before the first word longer than stallFirstSec → stopped and sent again; the error says nothing came at all', async () => {
+  _setConfig({ stallFirstSec: 1 });
+  const t0 = Date.now();
+  const res = await chat({ model: M, messages: msgs('#hang'), stream: true });
+  assert.equal(res.status, 502);
+  const m = (await res.json()).error.message;
+  assert.ok(Date.now() - t0 < 8000, `took ${Date.now() - t0} ms`);
+  assert.match(m, /模型那頭 1 秒沒出字/); assert.match(m, /一個字都還沒出/); assert.match(m, /重送過一次/);
+  assert.equal(_state().lastTurn.stalledBeforeText, true); assert.equal(_state().lastTurn.retriedAfterStall, true);
+});
+
+test('max_tokens does not count a <think> block written into the reply', async () => {
+  const s = await sseText(await chat({ model: M, messages: msgs('#think'), stream: true, max_tokens: 100 }));
+  assert.equal(s.finish, 'stop'); assert.match(s.text, /<\/think>\n狐狸回家了。$/);
+  assert.equal(_state().lastTurn.capped, false);
+});
+
+test('/status: agy missing → agyPath advice first and the error code; agy back → looked up again, warning gone', async () => {
+  _setConfig({ agyPath: path.join(tmp, 'no-such-agy.exe').replace(/\\/g, '/').toUpperCase(), statusRecheckMs: 0 });   // forward slashes, other case: still masked
+  let st = await (await fetch(`${base}/status`)).json();
+  assert.equal(st.agy.version, null);
+  assert.match(st.warnings[0], /agyPath/);
+  assert.ok(!st.warnings.some(w => /不在驗過的版本/.test(w)), JSON.stringify(st.warnings));   // no bogus "agy null not tested"
+  assert.match(st.agy.error, /ENOENT/);
+  assert.ok(!JSON.stringify(st).toLowerCase().includes(os.userInfo().username.toLowerCase()), `user name shown: ${JSON.stringify(st)}`);
+  assert.match(st.agy.path, /^~/);
+  _setConfig({ agyPath: BASE_CFG.agyPath, statusRecheckMs: 0 });
+  st = await (await fetch(`${base}/status`)).json();
+  assert.equal(st.agy.version, '1.4.2');
+  assert.equal(st.agy.error, undefined);
+  assert.ok(!st.warnings.some(w => /找不到 agy/.test(w)), JSON.stringify(st.warnings));
 });

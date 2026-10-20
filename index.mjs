@@ -16,7 +16,7 @@ import { loadConfig, applyRuntimePatch, publicConfig, isLoopback } from './lib/c
 import { parseMessages, textOf } from './lib/parse.mjs';
 import { planTurn, agentNameFor, renderAgentFile } from './lib/agent-file.mjs';
 import { humanError } from './lib/errors.mjs';
-import { runTurn, fetchModels, agyVersion, readAgySettings, cleanupConversation, resolveAgyPath } from './lib/agy.mjs';
+import { runTurn, fetchModels, agyVersion, readAgySettings, cleanupConversation, resolveAgyPath, agyMissLine, leadingThinkStripper, redactAgyLog, maskHome } from './lib/agy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ID = 'mint-agy-bridge';
@@ -25,8 +25,11 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 const MODELS_TTL_MS = 10 * 60 * 1000;
 const MODELS_RETRY_MS = 60 * 1000;
 const SMALL_MAX_TOKENS = 400;   // SillyTavern's default "max response length" is 300
+// Between the stalled half and the retry's reply in a stream (same wording style as the Cursor bridge 0.2.1).
+export const STALL_RETRY_NOTE = '\n\n〔前一發卡住，重來〕\n\n';
+const AGY_INIT_RETRIES = 3, AGY_INIT_RETRY_MS = 5000, STATUS_RECHECK_MS = 5000, STATUS_WAIT_MS = 3000;
 let warnedSmallMaxTokens = false;
-export const TESTED_AGY_VERSIONS = ['1.4.2'];
+export const TESTED_AGY_VERSIONS = ['1.4.2', '1.4.3'];
 
 function readOwnVersion() {
   try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || '0.0.0'; }
@@ -48,8 +51,47 @@ let logsDir = null;
 const running = new Map();      // chatKey → ticket being generated (or waiting for one) in that chat
 let requestCount = 0;
 let lastTurn = null;            // token counts and timing of the last reply (no content)
-let agyInfo = { path: null, version: null, versionTested: null, settings: null };
+let agyInfo = { path: null, version: null, versionTested: null, settings: null, error: null, checkedAt: 0 };
 const models = { list: [], at: 0, error: null, failAt: 0, inflight: null };
+let agyCheckInflight = null;
+
+/**
+ * Look for agy again: path, version, settings, and (when agy answers) the model list.
+ * Run at startup (with retries) and whenever /status is opened while something is missing, so a
+ * one-off failure at SillyTavern's startup does not stick until the next restart.
+ */
+function checkAgy() {
+  if (agyCheckInflight) return agyCheckInflight;
+  agyCheckInflight = (async () => {
+    const misses = [];
+    agyInfo.path = resolveAgyPath(cfg, misses);
+    const fellBack = !cfg.agyPath && misses.length && agyInfo.path === path.basename(agyInfo.path);
+    if (fellBack) console.warn(`${TAG} ${agyMissLine(misses)}`);
+    agyInfo.settings = readAgySettings(cfg);
+    const diag = {};
+    agyInfo.version = await agyVersion(cfg, diag);
+    agyInfo.versionTested = agyInfo.version ? TESTED_AGY_VERSIONS.includes(agyInfo.version) : null;
+    agyInfo.error = agyInfo.version ? null : `${diag.error || 'unknown'}${fellBack ? `｜${agyMissLine(misses)}` : ''}`;
+    if (!agyInfo.version) console.warn(`${TAG} 叫不動 agy（${agyInfo.path}）：${agyInfo.error}`);
+    else if (!models.list.length || models.error) await listModels({ refresh: true });
+    agyInfo.checkedAt = Date.now();
+  })().finally(() => { agyCheckInflight = null; });
+  return agyCheckInflight;
+}
+
+/**
+ * /status: when agy or the model list is missing, look again first (at most every few seconds), but wait
+ * for it only briefly — `agy models` alone takes ~8 s and the player opened this page because something
+ * is wrong. A slow check keeps running and the next refresh shows its result.
+ */
+export async function freshStatus() {
+  const missing = !agyInfo.version || !models.list.length;
+  const modelsBackingOff = agyInfo.version && models.failAt && Date.now() - models.failAt < MODELS_RETRY_MS;
+  if (missing && !modelsBackingOff && (agyCheckInflight || Date.now() - agyInfo.checkedAt >= (cfg.statusRecheckMs ?? STATUS_RECHECK_MS))) {
+    await Promise.race([checkAgy(), new Promise(r => setTimeout(r, cfg.statusWaitMs ?? STATUS_WAIT_MS))]);
+  }
+  return statusPayload();
+}
 
 // ── models: stale-while-revalidate, with a back-off after failures ─────────
 function refreshModels() {
@@ -165,7 +207,7 @@ function removeQuietly(p) { try { fs.rmSync(p, { recursive: true, force: true })
 
 // ── /v1/chat/completions ──────────────────────────────────────────────────
 export async function handleChatCompletions(req, res) {
-  const ticket = { chatKey: null, aborted: false, orphaned: false, handle: null, joined: null, fp: null, done: null, result: null };
+  const ticket = { chatKey: null, aborted: false, orphaned: false, answered: false, handle: null, joined: null, fp: null, done: null, result: null };
   let resolveDone; ticket.done = new Promise(r => { resolveDone = r; });
   let finished = false;
   const completionId = `chatcmpl-${randomUUID().slice(0, 8)}`;
@@ -175,7 +217,7 @@ export async function handleChatCompletions(req, res) {
   // SillyTavern closed the connection (phone locked, timeout, Stop button — indistinguishable).
   // Before agy started: drop it. After: keep going and store the reply (keepOnDisconnect), or stop.
   res.on('close', () => {
-    if (finished || ticket.aborted || ticket.orphaned) return;
+    if (finished || ticket.answered || ticket.aborted || ticket.orphaned) return;   // answered: we closed it ourselves
     if (!ticket.handle) { ticket.aborted = true; return; }
     if (cfg.keepOnDisconnect) {
       ticket.orphaned = true;
@@ -264,8 +306,8 @@ export async function handleChatCompletions(req, res) {
 
     const agentName = agentNameFor(plan.body);
     const agentFile = path.join(workspace, '.agents', 'agents', `${agentName}.md`);
-    const logFile = path.join(logsDir, `${agentName}.log`);
-    agentFiles.push(agentFile, logFile);
+    const logFileFor = attempt => path.join(logsDir, `${agentName}-${attempt}.log`);   // one per run: a retry must not overwrite the stalled run's log
+    agentFiles.push(agentFile, logFileFor(1), logFileFor(2));
     fs.mkdirSync(path.dirname(agentFile), { recursive: true });
     fs.mkdirSync(logsDir, { recursive: true });
     fs.writeFileSync(agentFile, renderAgentFile(agentName, plan.body), 'utf8');
@@ -288,27 +330,50 @@ export async function handleChatCompletions(req, res) {
       res.write(`data: ${JSON.stringify(makeChunk(completionId, modelId, { content: t }, null))}\n\n`);
     };
 
-    ticket.handle = runTurn({ cfg, workspace, agentName, model: modelId, stdinText: plan.stdinText, logFile, maxTokens, onText: writeText });
-    const r = await ticket.handle.done;
-    ticket.result = r;
+    // The reply is complete: answer SillyTavern now, without waiting for agy to exit (it may not —
+    // 26-10-20 two finished replies sat until the timeout). agy gets a few seconds more, then is stopped.
+    let flush = null;
+    const flushHeld = () => { if (flush) { const t = flush(); flush = null; if (t) writeText(t); } };
+    const onDone = d => {
+      if (ticket.answered || ticket.aborted || !alive()) return;
+      ticket.answered = true;
+      flushHeld();
+      if (isStream && sentText) {
+        res.write(`data: ${JSON.stringify(makeChunk(completionId, modelId, {}, d.finishReason))}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      } else replyWhole(res, isStream, completionId, modelId, d.text, d.usage, d.finishReason);
+    };
+    const runOnce = (attempt, onText = writeText) => {
+      ticket.handle = runTurn({ cfg, workspace, agentName, model: modelId, stdinText: plan.stdinText, logFile: logFileFor(attempt), maxTokens, onText, onDone });
+      return ticket.handle.done;
+    };
+    const canRetry = r1 => r1.stalled && cfg.stallRetry && !ticket.aborted && (alive() || ticket.orphaned);
+    let r = await runOnce(1);
+    bookkeep(r, { no, modelId, maxTokens, plan, msgs: messages.length, ticket, logFile: logFileFor(1), willRetry: canRetry(r) });
 
-    // ── bookkeeping
-    if (cfg.cleanupConversations) {
-      if (!r.conversationId) { if (!r.killed) console.warn(`${TAG}[${no}] 沒拿到 agy 對話編號，這一則的本機紀錄沒清到`); }
-      else {
-        const c = cleanupConversation(cfg, r.conversationId);
-        if (c.failed || !c.removed) console.warn(`${TAG}[${no}] 清 agy 本機紀錄：刪 ${c.removed} 個、失敗 ${c.failed} 個（對話 ${r.conversationId}）`);
+    // ── stalled → send the same request once more. The half that already went out cannot be taken back
+    // (a stream only appends), so a marked line separates it from the new reply. If that half already
+    // held a finished thinking block, the retry's own thinking block is left out of the stream.
+    let retried = false;
+    if (canRetry(r)) {
+      retried = true;
+      console.warn(`${TAG}[${no}] 模型那頭 ${r.stallSec} 秒沒出字（已出 ${r.text.length} 字），自動重送一次（會再算一發額度）`);
+      let onText = writeText;
+      if (sentText) {
+        writeText(STALL_RETRY_NOTE);
+        if (/<\/(think|thinking|reasoning)>/i.test(r.text)) {
+          const strip = leadingThinkStripper();
+          onText = t => { const o = strip.push(t); if (o) writeText(o); };
+          flush = () => strip.end();
+        }
       }
+      r = await runOnce(2, onText);
+      r.retriedAfterStall = true;
+      bookkeep(r, { no, modelId, maxTokens, plan, msgs: messages.length, ticket, logFile: logFileFor(2) });
     }
-    const u = r.usage || {};
-    const alarm = (r.unexpectedSteps.length || r.deniedActions) ? { unexpectedSteps: r.unexpectedSteps, deniedActions: r.deniedActions } : null;
-    if (alarm) console.warn(`${TAG}[${no}] ⚠ agy 出現非對話步驟或被拒動作：${JSON.stringify(alarm).slice(0, 400)}`);
-    const stopNote = r.capped ? `(到 max_tokens=${maxTokens} 收尾)` : r.contentBlocked ? '(內容過濾擋下，已停)' : r.timedOut ? '(逾時，橋停掉)' : '';
-    console.log(`${TAG}[${no}] ← ${r.ok ? 'ok' : 'fail'}${stopNote}${ticket.aborted ? '(讓位／停止)' : ticket.orphaned ? '(斷線後生完)' : ''} in=${u.input_tokens ?? 'n/a'} out=${u.output_tokens ?? 'n/a'} think=${u.thinking_tokens ?? 'n/a'} cacheR=${u.cache_read_tokens ?? 'n/a'} ttft=${r.ttftMs ?? 'n/a'}ms total=${r.ms}ms exit=${r.exitCode}`);
-    if (!r.ok && !ticket.aborted) console.error(`${TAG}[${no}] error: ${String(r.error?.message || r.error).slice(0, 500)}`);
-    const stop = { maxTokens: maxTokens || null, capped: r.capped, contentBlocked: r.contentBlocked, timedOut: r.timedOut, exitCode: r.exitCode, ...(r.ok ? {} : { error: String(r.error?.message || r.error || '').slice(0, 300) }) };
-    lastTurn = { model: modelId, ok: r.ok, usage: r.usage, ttftMs: r.ttftMs, ms: r.ms, at: new Date().toISOString(), movedToAgentFile: plan.movedToAgentFile, ...stop, ...(alarm ? { alarm } : {}) };
-    appendUsageLog({ t: lastTurn.at, n: no, model: modelId, ok: r.ok, aborted: ticket.aborted, orphaned: ticket.orphaned, maxTokens: maxTokens || null, capped: r.capped, contentBlocked: r.contentBlocked, timedOut: r.timedOut, usage: r.usage, ttftMs: r.ttftMs, ms: r.ms, agentFileBytes: plan.bytes.agentFile, stdinBytes: plan.bytes.stdin, movedToAgentFile: plan.movedToAgentFile, continuation: plan.continuation, msgs: messages.length, ...(alarm ? { alarm } : {}) });
+    flushHeld();
+    ticket.result = r;
 
     if (ticket.orphaned && !ticket.aborted && r.ok) {
       resumeStore.set(ticket.fp, { ok: true, text: r.text, usage: r.usage, finishReason: r.finishReason, at: Date.now() });
@@ -317,7 +382,7 @@ export async function handleChatCompletions(req, res) {
     if (!alive()) return;
     if (ticket.aborted) return replySuperseded(res, isStream, completionId, modelId);
 
-    const errText = r.ok ? null : humanError(r.error, { timedOut: r.timedOut, contentBlocked: r.contentBlocked, timeoutSec: cfg.printTimeoutSec, elapsedSec: Math.round(r.ms / 1000) });
+    const errText = r.ok ? null : humanError(r.error, { timedOut: r.timedOut, contentBlocked: r.contentBlocked, stalled: r.stalled, stallSec: r.stallSec, stalledBeforeText: r.stalledBeforeText, retried, timeoutSec: cfg.printTimeoutSec, elapsedSec: Math.round(r.ms / 1000) });
     if (!r.ok && !sentText) return fail(502, `薄荷橋：${errText}`);
     if (!isStream) return replyWhole(res, false, completionId, modelId, r.text, r.usage, r.finishReason);
     // Part of the reply already went out: keep it, and send the error as an error event (red notice).
@@ -340,6 +405,57 @@ export async function handleChatCompletions(req, res) {
     resolveDone(ticket.result);
     for (const f of agentFiles) removeQuietly(f);
   }
+}
+
+// ── agy's own log of a run that went wrong, kept so the next report can show what agy was waiting for ──
+const KEEP_AGY_LOGS = 5;
+
+/** Copy (redacted) into <plugin>/logs/, keep the newest few. Returns the kept name, or null. */
+function keepAgyLog(logFile, no, why) {
+  try {
+    if (!logFile || !fs.existsSync(logFile)) return null;
+    const dir = cfg.keptLogsDir || path.join(__dirname, 'logs');   // keptLogsDir: tests only
+    fs.mkdirSync(dir, { recursive: true });
+    const name = `${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}_${no}_${why}.log`;
+    fs.writeFileSync(path.join(dir, name), redactAgyLog(fs.readFileSync(logFile, 'utf8'), { known: [agyInfo.settings?.project] }), 'utf8');
+    const kept = fs.readdirSync(dir).filter(f => f.endsWith('.log')).sort();
+    for (const f of kept.slice(0, Math.max(0, kept.length - KEEP_AGY_LOGS))) fs.rmSync(path.join(dir, f), { force: true });
+    return `logs/${name}`;
+  } catch { return null; }
+}
+
+/** After each agy run: keep agy's log if it went wrong, clean agy's local copy, log one line, update /status and the usage log. */
+function bookkeep(r, { no, modelId, maxTokens, plan, msgs, ticket, logFile, willRetry = false }) {
+  // agy's log first (the temp copy is deleted when the request ends), then agy's local conversation files.
+  const why = r.lingered ? 'lingered' : r.stalled ? 'stalled' : r.timedOut ? 'timeout' : (!r.ok && !ticket.aborted && !r.contentBlocked) ? 'failed' : null;
+  const agyLog = why ? keepAgyLog(logFile, no, why) : null;
+  if (cfg.cleanupConversations) {
+    if (!r.conversationId) { if (!r.killed) console.warn(`${TAG}[${no}] 沒拿到 agy 對話編號，這一則的本機紀錄沒清到`); }
+    else {
+      const c = cleanupConversation(cfg, r.conversationId);
+      // A just-stopped agy (Windows) may still hold its files for a moment: try once more a little later.
+      if (c.failed) setTimeout(() => {
+        const c2 = cleanupConversation(cfg, r.conversationId);
+        if (c2.failed) console.warn(`${TAG}[${no}] 清 agy 本機紀錄：還有 ${c2.failed} 個刪不掉（對話 ${r.conversationId}）`);
+      }, cfg.cleanupRetryMs ?? 5000).unref?.();
+      else if (!c.removed) console.warn(`${TAG}[${no}] 清 agy 本機紀錄：一個都沒找到（對話 ${r.conversationId}）`);
+    }
+  }
+  const u = r.usage || {};
+  const alarm = (r.unexpectedSteps.length || r.deniedActions) ? { unexpectedSteps: r.unexpectedSteps, deniedActions: r.deniedActions } : null;
+  if (alarm) console.warn(`${TAG}[${no}] ⚠ agy 出現非對話步驟或被拒動作：${JSON.stringify(alarm).slice(0, 400)}`);
+  const stopNote = r.capped ? `(到 max_tokens=${maxTokens} 收尾)` : r.contentBlocked ? '(內容過濾擋下，已停)' : r.stalled ? `(${r.stallSec} 秒沒出字，橋停掉)` : r.lingered ? "(回覆已完成、agy 沒自己退出，橋收掉)" : r.timedOut ? '(逾時，橋停掉)' : '';
+  console.log(`${TAG}[${no}] ← ${r.ok ? 'ok' : 'fail'}${stopNote}${r.retriedAfterStall ? '(重送那發)' : ''}${ticket.aborted ? '(讓位／停止)' : ticket.orphaned ? '(斷線後生完)' : ''} in=${u.input_tokens ?? 'n/a'} out=${u.output_tokens ?? 'n/a'} think=${u.thinking_tokens ?? 'n/a'} cacheR=${u.cache_read_tokens ?? 'n/a'} ttft=${r.ttftMs ?? 'n/a'}ms total=${r.ms}ms ${r.tokPerSec ?? 'n/a'}tok/s exit=${r.exitCode}`);
+  if (!r.ok && !ticket.aborted) (willRetry ? console.warn : console.error)(`${TAG}[${no}] ${willRetry ? '（這發會重送）' : 'error: '}${String(r.error?.message || r.error).slice(0, 500)}`);
+  const stop = {
+    maxTokens: maxTokens || null, capped: r.capped, contentBlocked: r.contentBlocked, timedOut: r.timedOut,
+    stalled: r.stalled, ...(r.stalledBeforeText ? { stalledBeforeText: true } : {}), tokPerSec: r.tokPerSec, doneAtMs: r.doneAtMs, ...(r.textAfterDone ? { textAfterDone: true } : {}),
+    ...(r.lingered ? { lingered: true, sawResult: r.sawResult, postDoneHangSec: Math.round((r.ms - (r.sawDoneAtMs ?? r.doneAtMs ?? r.ms)) / 100) / 10 } : {}), ...(r.retriedAfterStall ? { retriedAfterStall: true } : {}),
+    exitCode: r.exitCode, ...(agyLog ? { agyLog } : {}), ...(r.ok ? {} : { error: String(r.error?.message || r.error || '').slice(0, 300) }),
+  };
+  lastTurn = { model: modelId, ok: r.ok, usage: r.usage, ttftMs: r.ttftMs, ms: r.ms, at: new Date().toISOString(), movedToAgentFile: plan.movedToAgentFile, ...stop, ...(alarm ? { alarm } : {}) };
+  const { error: _e, exitCode: _x, ...logStop } = stop;
+  appendUsageLog({ t: lastTurn.at, n: no, model: modelId, ok: r.ok, aborted: ticket.aborted, orphaned: ticket.orphaned, ...logStop, usage: r.usage, ttftMs: r.ttftMs, ms: r.ms, agentFileBytes: plan.bytes.agentFile, stdinBytes: plan.bytes.stdin, movedToAgentFile: plan.movedToAgentFile, continuation: plan.continuation, msgs, ...(alarm ? { alarm } : {}) });
 }
 
 /** Superseded by a newer request in the same chat: close this one cleanly so the client is not left hanging. */
@@ -370,18 +486,19 @@ function replyWhole(res, isStream, id, model, text, usage, finishReason = 'stop'
 // ── status ────────────────────────────────────────────────────────────────
 export function statusPayload() {
   const warnings = [];
-  if (configFileError) warnings.push(configFileError);
-  if (!agyInfo.version) warnings.push('找不到 agy 或讀不到版本——先照 README 裝好 Antigravity CLI。');
+  if (!agyInfo.version) warnings.push('找不到 agy 或讀不到版本：把 agy.exe 的完整路徑填進 config.json 的 agyPath（通常是 %LOCALAPPDATA%\\agy\\bin\\agy.exe），再重啟酒館；真的還沒裝才照 README 第 1 步裝。');
   else if (!agyInfo.versionTested) warnings.push(`agy ${agyInfo.version} 不在驗過的版本（${TESTED_AGY_VERSIONS.join('、')}）裡：大多照樣能用，有怪狀況請回報。`);
+  if (configFileError) warnings.push(configFileError);
   if (models.error && !models.list.length) warnings.push(models.error);
   if (agyInfo.settings?.useG1Credits) warnings.push('agy 全域設定 useG1Credits 是開的：免費額度用完會自動扣付費 AI 點數（要關請自己改 agy 的 settings.json，橋不會動它）。');
-  return {
+  // Players paste this page in public: the home folder (it carries the Windows user name) becomes "~".
+  return JSON.parse(maskHome(JSON.stringify({
     ok: true, plugin: PLUGIN_ID, version: readOwnVersion(),
     bridge: server ? { running: true, url: `http://${cfg.host}:${cfg.port}/v1`, busy: running.size, requestCount, last: lastTurn } : { running: false },
-    agy: { path: agyInfo.path, version: agyInfo.version, versionTested: agyInfo.versionTested, cloudProjectSignIn: agyInfo.settings?.cloudProjectSignIn ?? null, allowNonWorkspaceAccess: agyInfo.settings?.allowNonWorkspaceAccess ?? null },
+    agy: { path: agyInfo.path, version: agyInfo.version, versionTested: agyInfo.versionTested, ...(agyInfo.error ? { error: agyInfo.error } : {}), cloudProjectSignIn: agyInfo.settings?.cloudProjectSignIn ?? null, allowNonWorkspaceAccess: agyInfo.settings?.allowNonWorkspaceAccess ?? null },
     models: models.list.map(m => m.id),
     warnings,
-  };
+  })));
 }
 
 // ── HTTP server ───────────────────────────────────────────────────────────
@@ -416,7 +533,7 @@ export function createServer() {
         const list = await listModels({ refresh: url.searchParams.get('refresh') === '1' });
         return sendJson(res, 200, { object: 'list', data: list.map(m => ({ id: m.id, object: 'model', created: 0, owned_by: 'antigravity', name: m.label })) });
       }
-      if (req.method === 'GET' && (p === '/status' || p === '/')) return sendJson(res, 200, statusPayload());
+      if (req.method === 'GET' && (p === '/status' || p === '/')) return sendJson(res, 200, await freshStatus());
       if (req.method === 'GET' && p === '/config') return sendJson(res, 200, publicConfig(cfg));
       if (req.method === 'POST' && p === '/config') {
         try { const raw = await readBody(req); if (raw) applyRuntimePatch(cfg, JSON.parse(raw)); } catch { /* keep current */ }
@@ -471,7 +588,7 @@ export async function init(router) {
   }
 
   if (router) {
-    router.get('/status', (_req, res) => res.json(statusPayload()));
+    router.get('/status', async (_req, res) => res.json(await freshStatus()));
     router.get('/config', (_req, res) => res.json(publicConfig(cfg)));
     router.post('/config', (req, res) => res.json(publicConfig(applyRuntimePatch(cfg, req.body))));
     router.get('/models', async (req, res) => res.json(await listModels({ refresh: req.query?.refresh === '1' })));
@@ -482,9 +599,16 @@ export async function init(router) {
   agyInfo.settings = readAgySettings(cfg);
   if (server) {
     (async () => {
-      agyInfo.version = await agyVersion(cfg);
-      agyInfo.versionTested = agyInfo.version ? TESTED_AGY_VERSIONS.includes(agyInfo.version) : null;
-      const list = await listModels({ refresh: true });
+      // Not found at startup → try again a few times: twice a player's agy could not be read right as
+      // SillyTavern started, and could a minute later.
+      const tries = cfg.agyInitRetries ?? AGY_INIT_RETRIES, waitMs = cfg.agyInitRetryMs ?? AGY_INIT_RETRY_MS;
+      for (let i = 0; ; i++) {
+        await checkAgy();
+        if (agyInfo.version || i >= tries) break;
+        console.warn(`${TAG} 第 ${i + 1} 次叫不動 agy，${waitMs / 1000} 秒後再試（最多再試 ${tries} 次）`);
+        await new Promise(r => setTimeout(r, waitMs));
+      }
+      const list = models.list;
       console.log(`${TAG} agy ${agyInfo.version ?? '（找不到）'}｜模型 ${list.length} 個${list.length ? `：${list.map(m => m.id).join(', ')}` : ''}`);
       for (const w of statusPayload().warnings) console.warn(`${TAG} ⚠ ${w}`);
     })().catch(err => console.error(`${TAG} 啟動檢查失敗：${err.message}`));

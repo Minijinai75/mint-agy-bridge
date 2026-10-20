@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { planTurn, renderAgentFile, agentNameFor, LONG_MESSAGE_POINTER, CONTINUE_POINTER, CONTINUE_INSTRUCTION, BODY_MARKER, stdinLine } from '../lib/agent-file.mjs';
 import { humanError, parseAgyError } from '../lib/errors.mjs';
-import { parseModelList, estimateTokens, CONTENT_FILTER_RE } from '../lib/agy.mjs';
+import { parseModelList, estimateTokens, CONTENT_FILTER_RE, withoutThinking, visibleCounter, tokenWeight, resolveAgyPath, agyMissLine, leadingThinkStripper, redactAgyLog, maskHome } from '../lib/agy.mjs';
 import { loadConfig, applyRuntimePatch, publicConfig, DEFAULTS } from '../lib/config.mjs';
 
 const sys = c => ({ role: 'system', content: c });
@@ -239,4 +239,131 @@ test('agent body always starts with a non-front-matter marker line', () => {
   const file = renderAgentFile('mint-00000000-0000', plan.body);
   assert.equal(file.split('\n').filter(l => l === '---').length >= 2, true);
   assert.equal(file.split('\n').indexOf(BODY_MARKER), file.split('\n').indexOf('---', 1) + 2);
+});
+
+// ── 0.1.2 ─────────────────────────────────────────────────────────────────
+test('withoutThinking: closed blocks, an unclosed block (still thinking), any case; the story stays', () => {
+  assert.equal(withoutThinking('<think>想很多</think>\n故事'), '\n故事');
+  assert.equal(withoutThinking('<Thinking>a</Thinking>b<reasoning>c</reasoning>d'), 'bd');
+  assert.equal(withoutThinking('<think>還在想，沒寫完'), '');
+  assert.equal(withoutThinking('沒有思考段的故事'), '沒有思考段的故事');
+});
+
+test('resolveAgyPath: a default location that cannot be read is reported with its error code', { skip: process.platform !== 'win32' }, () => {
+  const saved = process.env.LOCALAPPDATA;
+  process.env.LOCALAPPDATA = path.join(os.tmpdir(), `mint-no-such-dir-${process.pid}`);
+  try {
+    const misses = [];
+    assert.equal(resolveAgyPath({}, misses), 'agy.exe');
+    assert.equal(misses.length, 1);
+    assert.equal(misses[0].code, 'ENOENT');
+    const line = agyMissLine(misses, process.env, String.raw`C:\ST`);
+    assert.match(line, /ENOENT/); assert.match(line, /LOCALAPPDATA=.*mint-no-such-dir/); assert.ok(line.includes(String.raw`cwd=C:\ST`), line);
+    assert.match(agyMissLine(misses, {}, 'x'), /LOCALAPPDATA=（沒設）/);
+  } finally { process.env.LOCALAPPDATA = saved; }
+});
+
+test('humanError: stalled → "模型那頭 N 秒沒出字", says whether it was already sent again', () => {
+  const a = humanError(new Error('bridge stopped agy: no new text for 60 s after 300 characters'), { stalled: true, stallSec: 60 });
+  assert.match(a, /模型那頭 60 秒沒出字/); assert.doesNotMatch(a, /重送過一次/);
+  assert.match(humanError(new Error('x'), { stalled: true, stallSec: 60, retried: true }), /重送過一次/);
+});
+
+test('humanError: agy not found → fill agyPath comes first, reinstall last', () => {
+  const e = Object.assign(new Error('spawn agy.exe ENOENT'), { code: 'ENOENT', syscall: 'spawn agy.exe' });
+  const t = humanError(e);
+  assert.ok(t.indexOf('agyPath') < t.indexOf('才照 README'), t);
+});
+
+test('config: stallSec clamps to 0..3600 (0 = off) and is a runtime key', () => {
+  assert.equal(DEFAULTS.stallSec, 120); assert.equal(DEFAULTS.stallRetry, true);
+  const c = { ...DEFAULTS };
+  applyRuntimePatch(c, { stallSec: 99999, stallRetry: false });
+  assert.equal(c.stallSec, 3600); assert.equal(c.stallRetry, false);
+  applyRuntimePatch(c, { stallSec: -5 });
+  assert.equal(c.stallSec, 0);
+});
+
+test('agyPath: %VARIABLES% are expanded (the printed advice uses %LOCALAPPDATA%); unknown ones stay', () => {
+  process.env.MINT_TEST_DIR = String.raw`C:\X`;
+  assert.equal(resolveAgyPath({ agyPath: String.raw`%MINT_TEST_DIR%\agy\bin\agy.exe` }), String.raw`C:\X\agy\bin\agy.exe`);
+  assert.equal(resolveAgyPath({ agyPath: String.raw`%MINT_NO_SUCH_VAR%\agy.exe` }), String.raw`%MINT_NO_SUCH_VAR%\agy.exe`);
+  delete process.env.MINT_TEST_DIR;
+});
+
+test('visibleCounter (streaming) agrees with withoutThinking on any split, tags cut between pieces included', () => {
+  const texts = [
+    '<think>\n先想角色的心情。</think>\n狐狸回家了。',
+    '<Thinking>a b c</Thinking>故事<reasoning>再想</reasoning>結尾',
+    '<think>還沒想完，被切在這裡',
+    '沒有思考段 a<b 也照算',
+    'English story </think> stray close tag stays visible',
+  ];
+  for (const s of texts) {
+    const want = tokenWeight(withoutThinking(s));
+    for (const size of [1, 2, 3, 5, 7, 100]) {
+      const c = visibleCounter();
+      for (let i = 0; i < s.length; i += size) c.push(s.slice(i, i + size));
+      assert.ok(Math.abs(c.weight - want) < 1e-9, `${JSON.stringify(s)} size ${size}: ${c.weight} vs ${want}`);
+    }
+  }
+  const t = visibleCounter(); t.push('<think>只有思考'); assert.equal(t.hasVisible, false);
+  t.push('</think>正文'); assert.equal(t.hasVisible, true);
+});
+
+test('redactAgyLog: e-mail, project id (also inside API URLs), tokens, home folder and permission rules are masked; the cause stays', () => {
+  const home = String.raw`C:\Users\Someone`;
+  // lines shaped like agy 1.4.3's own log (26-10-20), plus forms the review asked about
+  const raw = [
+    'I1020 server_oauth.go:224] applyAuthResult: email=someone@example.com, authMethod=gcp, quotaProject=quiet-river-123456-a1',
+    'I1020 http.go:349] URL: https://aiplatform.googleapis.com/v1/projects/quiet-river-123456-a1/locations/global/publishers/google/models',
+    String.raw`I1020 cli.go:90] antigravity workspaceDirs=[C:\Users\Someone\AppData\Local\Temp\mint-agy-bridge-x\ws] appDataDir=c:/users/someone/.gemini/antigravity-cli languageServer=1`,
+    String.raw`I1020 cli_setting_manager.go:92] CLI settings initialized: permissions=&{Allow:[command(Get-ChildItem -Path "C:\Users\Someone\Videos\My Secret Folder\" | Select-Object Name)]}`,
+    'I1020 server.go:1199] Conversation using project ID: quiet-river-123456-a1',
+    'I1020 server.go:2217] Backend project ID updated dynamically to: tidy-hill-998877',
+    String.raw`E1020 store.go:41] open C:\Users\Someone\.gemini\antigravity-cli\conversations\abc.db: database is locked`,
+    String.raw`E1020 rm.go:12] failed to remove C:\Users\Other\x.lock because it is in use`,
+    'Authorization: Bearer ya29.a0AfB_byC-xyz',
+    '{"quota_project_id": "quiet-river-123456-a1", "key": "AIzaSyD-abcdefghijklmnopqrstuvwxyz012"}',
+    'I1020 linux.go:1] home /home/someone/.gemini',
+    'gcp project from settings: secret-proj-42',
+  ].join('\n');
+  const out = redactAgyLog(raw, { home, known: ['secret-proj-42'] });
+  for (const secret of ['someone@example.com', 'quiet-river', 'tidy-hill', 'Someone', 'someone', 'Other', 'My Secret Folder', 'Videos', 'ya29', 'AIzaSy', 'secret-proj-42']) assert.ok(!out.includes(secret), `${secret} left: ${out}`);
+  assert.match(out, /applyAuthResult: email=<email>, authMethod=gcp, quotaProject=<project>/);
+  assert.match(out, /projects\/<project>\/locations/);
+  assert.ok(out.includes(String.raw`appDataDir=~/.gemini/antigravity-cli languageServer=1`), out);   // the rest of the path and the next key survive
+  assert.ok(out.includes(String.raw`open ~\.gemini\antigravity-cli\conversations\abc.db: database is locked`), out);   // the cause survives
+  assert.ok(out.includes(String.raw`failed to remove ~\x.lock because it is in use`), out);
+  assert.ok(out.includes('permissions=&{<permission rules>}'), out);
+  assert.equal(out.split('\n').length, 12);
+});
+
+test('maskHome: the home folder in any spelling — slashes, JSON-doubled backslashes, case', () => {
+  const home = String.raw`C:\Users\Someone`;
+  assert.equal(maskHome(String.raw`C:\Users\Someone\a`, home), String.raw`~\a`);
+  assert.equal(maskHome('c:/users/someone/a', home), '~/a');
+  assert.equal(maskHome(JSON.stringify({ p: String.raw`C:\Users\Someone\a` }), home), JSON.stringify({ p: String.raw`~\a` }));
+  assert.equal(maskHome('nothing here', home), 'nothing here');
+});
+
+test('visibleCounter: thinking past its limit counts again (an unclosed or mismatched tag cannot switch max_tokens off)', () => {
+  const c = visibleCounter(50);
+  c.push('<thinking>想一下</think>');
+  for (let i = 0; i < 40; i++) c.push('狐狸在雪地裡慢慢走著回家。');
+  assert.ok(c.weight > 100, `weight ${c.weight}`);
+  assert.equal(c.hasVisible, true);
+  const d = visibleCounter(50);
+  d.push('<think>短短想</think>正文');   // under the limit: thinking still left out
+  assert.equal(d.weight, tokenWeight('正文'));
+});
+
+test('leadingThinkStripper: drops a leading thinking block (tags cut across pieces too); anything else passes', () => {
+  const run = (pieces) => { const s = leadingThinkStripper(); return pieces.map(p => s.push(p)).join('') + s.end(); };
+  assert.equal(run(['\n<thi', 'nk>想B', '</think>\n', '全文。']), '全文。');
+  assert.equal(run(['<Thinking>x</Thinking>', 'y']), 'y');
+  assert.equal(run(['沒有思考', '直接寫']), '沒有思考直接寫');
+  assert.equal(run(['<b>粗體</b>開頭']), '<b>粗體</b>開頭');
+  assert.equal(run(['<think>沒關上就結束']), '<think>沒關上就結束');   // shown, not hidden
+  assert.equal(run(['正文 <think>中間的不動</think>']), '正文 <think>中間的不動</think>');
 });
