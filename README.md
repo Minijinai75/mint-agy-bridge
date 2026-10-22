@@ -22,6 +22,8 @@ irm https://antigravity.google/cli/install.ps1 | iex
 curl -fsSL https://antigravity.google/cli/install.sh | bash
 ```
 
+這行要在**你自己開的終端機**跑（開始功能表 → PowerShell 或 Windows Terminal）。叫 Claude 桌面版這類 App 裡的 AI 替你跑的話，agy 會被裝進那個 App 自己的抽屜、酒館看不到——為什麼、怎麼判、怎麼救，看下面的〔[MSIX 封裝 App 的檔案虛擬化](#msix-封裝-app-的檔案虛擬化叫-claude-桌面版幫你裝-agy-會撞到)〕。
+
 **2. 登入 agy**
 
 在終端機打 `agy`，照畫面登入一次，然後打 `agy models` 看你有哪些模型。登入方式決定模型清單（官方說明：<https://antigravity.google/docs/install/>）：
@@ -107,7 +109,7 @@ git clone https://github.com/Minijinai75/mint-agy-bridge.git
 
 | 看到 | 原因與處理 |
 |---|---|
-| 找不到 agy 程式／狀態頁說找不到 agy | 先在 `config.json` 填 `agyPath`（agy.exe 的完整路徑）再重啟酒館，這招最快。agy 明明裝好卻偶爾在酒館剛啟動時找不到（有玩家撞過兩次）：0.1.2 起橋會隔 5 秒再找、最多三次，打開狀態頁也會重找一次；主控台會印出那一刻讀不到的原因代碼（`ENOENT`、`EBUSY`、`EPERM`…），回報時附上。真的沒裝才回第 1 步 |
+| 找不到 agy 程式／狀態頁說找不到 agy | 先在 `config.json` 填 `agyPath`（agy.exe 的完整路徑）再重啟酒館，這招最快。agy 明明裝好卻偶爾在酒館剛啟動時找不到（有玩家撞過兩次）：0.1.2 起橋會隔 5 秒再找、最多三次，打開狀態頁也會重找一次；主控台會印出那一刻讀不到的原因代碼（`ENOENT`、`EBUSY`、`EPERM`…），回報時附上。**agy 是叫 Claude 桌面版幫你裝的、`agyPath` 填了完整路徑還是 `ENOENT`**：看下面的〔MSIX 封裝 App 的檔案虛擬化〕，0.1.3 起狀態頁會多提示這一句。真的沒裝才回第 1 步 |
 | 模型那頭 N 秒沒出字 | 回覆停住不動（生到一半，或一個字都還沒出），不是逾時，也不是橋壞了。通知裡寫「已經自動重送過一次」的，表示重送那發也卡住了；等一兩分鐘再按重新生成，一直這樣就換模型 |
 | 模型不在你 agy 帳號的清單裡 | 你的登入方式看不到這顆。重新整理酒館的模型清單再選 |
 | Google Cloud 專案的配額不夠（429） | 到 Google Cloud 主控台「配額」頁替那顆模型申請提高，或換模型 |
@@ -127,6 +129,25 @@ git clone https://github.com/Minijinai75/mint-agy-bridge.git
 | 埠 5499 被佔用 | 可能已經有一座在跑（例如酒館裡一座、又手動開了 standalone）。要兩座就在 `config.json` 改 `port`，酒館的網址跟著改 |
 
 狀態頁出現「useG1Credits 是開的」：這是 agy 的全域設定，免費額度用完會自動扣付費 AI 點數。橋不會改它，要不要關由你決定。
+
+### MSIX 封裝 App 的檔案虛擬化（叫 Claude 桌面版幫你裝 agy 會撞到）
+
+**症狀**：agy 明明「裝好了」、在 Claude 桌面版裡面叫得動，但從桌面點開的酒館一直說找不到 agy；`config.json` 的 `agyPath` 填了完整路徑也一樣 `ENOENT`。從 Claude 裡面開的酒館卻正常。
+
+**原因**：Claude 桌面版（Windows）是 **MSIX 封裝**的 App（微軟商店那種包法）。這類 App、以及它開出來的所有子程序（包括你在裡面叫 AI 開的 PowerShell），寫進 `%LOCALAPPDATA%` 的檔案會被 Windows 悄悄轉存到 `%LOCALAPPDATA%\Packages\Claude_<一串代碼>\LocalCache\Local\` 底下——這叫「檔案虛擬化」。對那個 App 來說路徑看起來沒變、檔案都在；對別的程式來說，同一個路徑是空的。所以在 Claude 裡跑 `install.ps1` 裝的 agy，其實住進了 Claude 的私人抽屜，只有 Claude 跟它開出來的程式看得到；安裝器加進 PATH 的那一筆也在抽屜裡，桌面上的 PATH 一樣沒有 agy。agy 的登入不受影響（`~/.gemini` 不在虛擬化的範圍）。橋 0.1.2 的「隔 5 秒再找」和狀態頁重查在這個情境下都會正確地失敗：對酒館那個程序來說，檔案真的不存在。
+
+**判法**：在 Claude **外面**、自己開的終端機（開始功能表 → PowerShell）跑：
+
+```powershell
+dir $env:LOCALAPPDATA\agy\bin\agy.exe
+dir $env:LOCALAPPDATA\Packages\Claude_*\LocalCache\Local\agy\bin\agy.exe
+```
+
+第一行紅字說找不到、第二行卻列出了 `agy.exe`，就是這個問題。（cmd 的寫法：`dir %LOCALAPPDATA%\agy\bin`。）第二行也紅字＝agy 不在 Claude 的抽屜裡，是別的原因，回上面那張表。
+
+**修法**：在自己開的終端機（不是 Claude 裡面那個）重跑一次第 1 步的安裝指令，agy 就會裝進真的 `%LOCALAPPDATA%`，不用重新登入；然後從桌面重開酒館。還是想叫 AI 替你裝的話，請它把安裝指令寫成一個 `.bat`，再用 `explorer.exe <那個 .bat 的完整路徑>` 開——借桌面（explorer）的身分跑，就不在 App 的抽屜裡了。
+
+其他從微軟商店裝的 App 也可能是同樣的包法，判法一樣。0.1.3 起，找不到 agy 而且找過的路徑在 `AppData\Local` 底下時，狀態頁、主控台和錯誤通知會多提示這一句。（26-10-21 朔牽星在亭仔腳破案並實測修法，謝謝。）
 
 ## 它怎麼運作、安全嗎
 

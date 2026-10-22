@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, applyRuntimePatch, publicConfig, isLoopback } from './lib/config.mjs';
 import { parseMessages, textOf } from './lib/parse.mjs';
 import { planTurn, agentNameFor, renderAgentFile } from './lib/agent-file.mjs';
-import { humanError } from './lib/errors.mjs';
+import { humanError, msixHint } from './lib/errors.mjs';
 import { runTurn, fetchModels, agyVersion, readAgySettings, cleanupConversation, resolveAgyPath, agyMissLine, leadingThinkStripper, redactAgyLog, maskHome } from './lib/agy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -29,7 +29,7 @@ const SMALL_MAX_TOKENS = 400;   // SillyTavern's default "max response length" i
 export const STALL_RETRY_NOTE = '\n\n〔前一發卡住，重來〕\n\n';
 const AGY_INIT_RETRIES = 3, AGY_INIT_RETRY_MS = 5000, STATUS_RECHECK_MS = 5000, STATUS_WAIT_MS = 3000;
 let warnedSmallMaxTokens = false;
-export const TESTED_AGY_VERSIONS = ['1.4.2', '1.4.3'];
+export const TESTED_AGY_VERSIONS = ['1.4.2', '1.4.3', '1.4.4'];
 
 function readOwnVersion() {
   try { return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || '0.0.0'; }
@@ -51,7 +51,7 @@ let logsDir = null;
 const running = new Map();      // chatKey → ticket being generated (or waiting for one) in that chat
 let requestCount = 0;
 let lastTurn = null;            // token counts and timing of the last reply (no content)
-let agyInfo = { path: null, version: null, versionTested: null, settings: null, error: null, checkedAt: 0 };
+let agyInfo = { path: null, version: null, versionTested: null, settings: null, error: null, hint: null, checkedAt: 0 };
 const models = { list: [], at: 0, error: null, failAt: 0, inflight: null };
 let agyCheckInflight = null;
 
@@ -72,6 +72,8 @@ function checkAgy() {
     agyInfo.version = await agyVersion(cfg, diag);
     agyInfo.versionTested = agyInfo.version ? TESTED_AGY_VERSIONS.includes(agyInfo.version) : null;
     agyInfo.error = agyInfo.version ? null : `${diag.error || 'unknown'}${fellBack ? `｜${agyMissLine(misses)}` : ''}`;
+    // ENOENT under AppData\Local → maybe an agy installed from inside an MSIX app (see MSIX_HINT in errors.mjs).
+    agyInfo.hint = agyInfo.version ? null : msixHint([...misses, { path: diag.path, code: diag.code }]);
     if (!agyInfo.version) console.warn(`${TAG} 叫不動 agy（${agyInfo.path}）：${agyInfo.error}`);
     else if (!models.list.length || models.error) await listModels({ refresh: true });
     agyInfo.checkedAt = Date.now();
@@ -486,8 +488,10 @@ function replyWhole(res, isStream, id, model, text, usage, finishReason = 'stop'
 // ── status ────────────────────────────────────────────────────────────────
 export function statusPayload() {
   const warnings = [];
-  if (!agyInfo.version) warnings.push('找不到 agy 或讀不到版本：把 agy.exe 的完整路徑填進 config.json 的 agyPath（通常是 %LOCALAPPDATA%\\agy\\bin\\agy.exe），再重啟酒館；真的還沒裝才照 README 第 1 步裝。');
-  else if (!agyInfo.versionTested) warnings.push(`agy ${agyInfo.version} 不在驗過的版本（${TESTED_AGY_VERSIONS.join('、')}）裡：大多照樣能用，有怪狀況請回報。`);
+  if (!agyInfo.version) {
+    warnings.push('找不到 agy 或讀不到版本：把 agy.exe 的完整路徑填進 config.json 的 agyPath（通常是 %LOCALAPPDATA%\\agy\\bin\\agy.exe），再重啟酒館；真的還沒裝才照 README 第 1 步裝。');
+    if (agyInfo.hint) warnings.push(agyInfo.hint);   // right after the agyPath advice: "fill agyPath" stays first (0.1.2)
+  } else if (!agyInfo.versionTested) warnings.push(`agy ${agyInfo.version} 不在驗過的版本（${TESTED_AGY_VERSIONS.join('、')}）裡：大多照樣能用，有怪狀況請回報。`);
   if (configFileError) warnings.push(configFileError);
   if (models.error && !models.list.length) warnings.push(models.error);
   if (agyInfo.settings?.useG1Credits) warnings.push('agy 全域設定 useG1Credits 是開的：免費額度用完會自動扣付費 AI 點數（要關請自己改 agy 的 settings.json，橋不會動它）。');
@@ -626,4 +630,5 @@ export async function exit() {
 export function _setConfig(patch) { cfg = { ...cfg, ...patch }; return cfg; }
 export function _setWorkspace(ws, logs) { workspace = ws; logsDir = logs; fs.mkdirSync(path.join(ws, '.agents', 'agents'), { recursive: true }); fs.mkdirSync(logs, { recursive: true }); }
 export function _setModels(list) { models.list = list; models.at = list.length ? Date.now() : 0; models.error = null; models.failAt = 0; }
+export function _forgetAgy() { agyInfo = { path: null, version: null, versionTested: null, settings: null, error: null, hint: null, checkedAt: 0 }; }   // /status looks again only while agy is missing
 export function _state() { return { requestCount, busy: running.size, lastTurn, resumeKeys: [...resumeStore.keys()] }; }

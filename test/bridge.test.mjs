@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createServer, _setConfig, _setWorkspace, _setModels, _state, STALL_RETRY_NOTE } from '../index.mjs';
+import { createServer, _setConfig, _setWorkspace, _setModels, _state, _forgetAgy, STALL_RETRY_NOTE } from '../index.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mint-test-'));
@@ -528,4 +528,35 @@ test('/status: agy missing → agyPath advice first and the error code; agy back
   assert.equal(st.agy.version, '1.4.2');
   assert.equal(st.agy.error, undefined);
   assert.ok(!st.warnings.some(w => /找不到 agy/.test(w)), JSON.stringify(st.warnings));
+});
+
+// 26-10-21 朔牽星: an agy installed from inside the Claude desktop app (MSIX) is ENOENT for a SillyTavern
+// started from the desktop, full agyPath or not. The hint fits ENOENT under AppData\Local and nothing else.
+test('/status: ENOENT on a path under AppData\\Local → the MSIX hint right after the agyPath advice; ENOENT elsewhere → no hint', async () => {
+  const MSIX = /Claude 桌面版/;
+  _forgetAgy();
+  _setConfig({ agyPath: path.join(tmp, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'), statusRecheckMs: 0 });
+  let st = await (await fetch(`${base}/status`)).json();
+  assert.equal(st.agy.version, null);
+  assert.match(st.agy.error, /ENOENT/);
+  assert.match(st.warnings[0], /agyPath/);
+  assert.match(st.warnings[1], MSIX);
+  assert.match(st.warnings[1], /explorer\.exe/);
+  assert.equal(st.warnings.filter(w => MSIX.test(w)).length, 1);
+  assert.ok(!JSON.stringify(st).toLowerCase().includes(os.userInfo().username.toLowerCase()), `user name shown: ${JSON.stringify(st)}`);
+
+  // Same ENOENT, a path outside AppData\Local: no hint.
+  _forgetAgy();
+  _setConfig({ agyPath: path.join(path.parse(tmp).root, `mint-no-such-${process.pid}`, 'agy.exe'), statusRecheckMs: 0 });
+  st = await (await fetch(`${base}/status`)).json();
+  assert.equal(st.agy.version, null);
+  assert.match(st.agy.error, /ENOENT/);
+  assert.match(st.warnings[0], /agyPath/);
+  assert.ok(!st.warnings.some(w => MSIX.test(w)), JSON.stringify(st.warnings));
+
+  // agy back: the hint goes with the error.
+  _setConfig({ agyPath: BASE_CFG.agyPath, statusRecheckMs: 0 });
+  st = await (await fetch(`${base}/status`)).json();
+  assert.equal(st.agy.version, '1.4.2');
+  assert.ok(!st.warnings.some(w => MSIX.test(w)), JSON.stringify(st.warnings));
 });

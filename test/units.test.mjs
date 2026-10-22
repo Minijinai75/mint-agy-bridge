@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { planTurn, renderAgentFile, agentNameFor, LONG_MESSAGE_POINTER, CONTINUE_POINTER, CONTINUE_INSTRUCTION, BODY_MARKER, stdinLine } from '../lib/agent-file.mjs';
-import { humanError, parseAgyError } from '../lib/errors.mjs';
+import { humanError, parseAgyError, msixHint, MSIX_HINT } from '../lib/errors.mjs';
 import { parseModelList, estimateTokens, CONTENT_FILTER_RE, withoutThinking, visibleCounter, tokenWeight, resolveAgyPath, agyMissLine, leadingThinkStripper, redactAgyLog, maskHome } from '../lib/agy.mjs';
 import { loadConfig, applyRuntimePatch, publicConfig, DEFAULTS } from '../lib/config.mjs';
 
@@ -273,6 +273,35 @@ test('humanError: agy not found → fill agyPath comes first, reinstall last', (
   const e = Object.assign(new Error('spawn agy.exe ENOENT'), { code: 'ENOENT', syscall: 'spawn agy.exe' });
   const t = humanError(e);
   assert.ok(t.indexOf('agyPath') < t.indexOf('才照 README'), t);
+  assert.doesNotMatch(t, /Claude 桌面版/);   // a bare "agy.exe" on PATH says nothing about where it was installed
+});
+
+// 26-10-21 朔牽星: agy installed from inside the Claude desktop app (MSIX) lives in that app's private
+// LocalCache and is ENOENT for everyone else. The hint fits only ENOENT on a path under AppData\Local.
+test('msixHint: ENOENT under AppData\\Local (either slash, any case) → the hint; other paths or codes → nothing', () => {
+  const local = String.raw`C:\Users\Someone\AppData\Local\agy\bin\agy.exe`;
+  assert.equal(msixHint([{ path: local, code: 'ENOENT' }]), MSIX_HINT);
+  assert.equal(msixHint([{ path: 'C:/Users/Someone/AppData/Local/agy/bin/agy.exe', code: 'ENOENT' }]), MSIX_HINT);
+  assert.equal(msixHint([{ path: local.toUpperCase(), code: 'ENOENT' }]), MSIX_HINT);
+  assert.equal(msixHint([{ path: String.raw`D:\tools\agy.exe`, code: 'ENOENT' }, { path: local, code: 'ENOENT' }]), MSIX_HINT);   // any attempt fits
+  assert.equal(msixHint([{ path: local, code: 'EBUSY' }]), null);
+  assert.equal(msixHint([{ path: local, code: 'EPERM' }]), null);
+  assert.equal(msixHint([{ path: String.raw`D:\tools\agy.exe`, code: 'ENOENT' }]), null);
+  assert.equal(msixHint([{ path: '/home/someone/.local/bin/agy', code: 'ENOENT' }]), null);
+  assert.equal(msixHint([{ path: 'agy.exe', code: 'ENOENT' }]), null);
+  assert.equal(msixHint([{ path: null, code: 'ENOENT' }]), null);
+  assert.equal(msixHint([]), null);
+  assert.equal(msixHint(undefined), null);
+  assert.match(MSIX_HINT, /Claude 桌面版/); assert.match(MSIX_HINT, /explorer\.exe/); assert.match(MSIX_HINT, /MSIX 封裝 App 的檔案虛擬化/);   // README heading it points to
+});
+
+test('humanError: spawn ENOENT on a full agyPath under AppData\\Local → agyPath advice, then the MSIX hint', () => {
+  const p = String.raw`C:\Users\Someone\AppData\Local\agy\bin\agy.exe`;
+  const t = humanError(Object.assign(new Error(`spawn ${p} ENOENT`), { code: 'ENOENT', syscall: `spawn ${p}`, path: p }));
+  assert.match(t, /找不到 agy 程式/); assert.match(t, /Claude 桌面版/);
+  assert.ok(t.indexOf('agyPath') < t.indexOf('Claude 桌面版') && t.indexOf('Claude 桌面版') < t.indexOf('原始錯誤'), t);
+  const other = String.raw`D:\tools\agy\agy.exe`;
+  assert.doesNotMatch(humanError(Object.assign(new Error(`spawn ${other} ENOENT`), { code: 'ENOENT', syscall: `spawn ${other}`, path: other })), /Claude 桌面版/);
 });
 
 test('config: stallSec clamps to 0..3600 (0 = off) and is a runtime key', () => {
