@@ -545,6 +545,14 @@ test('/status: ENOENT on a path under AppData\\Local → the MSIX hint right aft
   assert.equal(st.warnings.filter(w => MSIX.test(w)).length, 1);
   assert.ok(!JSON.stringify(st).toLowerCase().includes(os.userInfo().username.toLowerCase()), `user name shown: ${JSON.stringify(st)}`);
 
+  // The model list failing for the same reason must not repeat the two sentences above.
+  _setModels([]);
+  await fetch(`${base}/v1/models`);
+  st = await (await fetch(`${base}/status`)).json();
+  assert.equal(st.warnings.filter(w => MSIX.test(w)).length, 1, JSON.stringify(st.warnings));
+  assert.equal(st.warnings.filter(w => /agyPath/.test(w)).length, 1, JSON.stringify(st.warnings));
+  _setModels([{ id: 'gemini-4-argon-high', label: 'Gemini 4 Argon (High)' }, { id: 'gemini-3.8-flash-low', label: 'Flash' }]);
+
   // Same ENOENT, a path outside AppData\Local: no hint.
   _forgetAgy();
   _setConfig({ agyPath: path.join(path.parse(tmp).root, `mint-no-such-${process.pid}`, 'agy.exe'), statusRecheckMs: 0 });
@@ -559,4 +567,59 @@ test('/status: ENOENT on a path under AppData\\Local → the MSIX hint right aft
   st = await (await fetch(`${base}/status`)).json();
   assert.equal(st.agy.version, '1.4.2');
   assert.ok(!st.warnings.some(w => MSIX.test(w)), JSON.stringify(st.warnings));
+});
+
+// The drawer is readable from outside: when some app's LocalCache holds an agy, say which and where.
+test('/status: the agy found in an app\'s LocalCache drawer → the warning names the app and the path, agy.hiddenIn set', async () => {
+  const fakeLocal = path.join(tmp, 'fake-localappdata');
+  const drawer = path.join(fakeLocal, 'Packages', 'Claude_test1234', 'LocalCache', 'Local', 'agy', 'bin');
+  fs.mkdirSync(drawer, { recursive: true });
+  fs.writeFileSync(path.join(drawer, 'agy.exe'), 'MZ');
+  const savedLocal = process.env.LOCALAPPDATA;
+  process.env.LOCALAPPDATA = fakeLocal;
+  try {
+    _forgetAgy();
+    _setConfig({ agyPath: path.join(tmp, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'), statusRecheckMs: 0 });
+    const st = await (await fetch(`${base}/status`)).json();
+    assert.equal(st.agy.version, null);
+    assert.match(st.warnings[1], /agy 其實在 Claude_test1234 這個 App 的私人抽屜裡/);
+    assert.ok(st.warnings[1].includes(String.raw`Claude_test1234\LocalCache\Local\agy\bin\agy.exe`.replace(/\\/g, path.sep)), st.warnings[1]);
+    assert.doesNotMatch(st.warnings[1], /若是/);
+    assert.ok(st.agy.hiddenIn && st.agy.hiddenIn.includes('Claude_test1234'), JSON.stringify(st.agy));
+    assert.ok(!JSON.stringify(st).toLowerCase().includes(os.userInfo().username.toLowerCase()), `user name shown: ${JSON.stringify(st)}`);
+  } finally {
+    process.env.LOCALAPPDATA = savedLocal;
+    _setConfig({ agyPath: BASE_CFG.agyPath, statusRecheckMs: 0 });
+    await fetch(`${base}/status`);
+  }
+});
+
+// The real incident's path: no agyPath, the default location is missing, and "agy.exe" is not on PATH.
+// The status page judges from the default location; the chat error must carry the same verdict although
+// the spawn error only says "agy.exe".
+test('no agyPath, default location missing → MSIX hint on /status and in the chat error', { skip: process.platform !== 'win32' }, async () => {
+  const fakeLocal = path.join(tmp, 'fake-localappdata-empty');
+  fs.mkdirSync(fakeLocal, { recursive: true });
+  const emptyPath = path.join(tmp, 'empty-path');
+  fs.mkdirSync(emptyPath, { recursive: true });
+  const saved = { LOCALAPPDATA: process.env.LOCALAPPDATA, PATH: process.env.PATH };
+  process.env.LOCALAPPDATA = fakeLocal;      // under the real AppData\Local\Temp, so the default location fits the hint
+  process.env.PATH = emptyPath;              // a bare "agy.exe" must be ENOENT whatever this machine has installed
+  try {
+    _forgetAgy();
+    _setConfig({ agyPath: '', statusRecheckMs: 0 });
+    const st = await (await fetch(`${base}/status`)).json();
+    assert.equal(st.agy.version, null);
+    assert.equal(st.agy.path, 'agy.exe');
+    assert.match(st.agy.error, /預設位置讀不到 agy/); assert.match(st.agy.error, /ENOENT/);
+    assert.match(st.warnings[1], /Claude 桌面版/);
+    const res = await chat({ model: M, messages: msgs('#msix'), stream: false });
+    const body = await res.json();
+    const message = body.error?.message || body.error || '';
+    assert.match(message, /找不到 agy 程式/); assert.match(message, /Claude 桌面版/); assert.match(message, /MSIX 封裝 App 的檔案虛擬化/);
+  } finally {
+    process.env.LOCALAPPDATA = saved.LOCALAPPDATA; process.env.PATH = saved.PATH;
+    _setConfig({ agyPath: BASE_CFG.agyPath, statusRecheckMs: 0 });
+    await fetch(`${base}/status`);
+  }
 });

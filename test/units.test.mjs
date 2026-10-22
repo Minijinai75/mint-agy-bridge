@@ -6,8 +6,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { planTurn, renderAgentFile, agentNameFor, LONG_MESSAGE_POINTER, CONTINUE_POINTER, CONTINUE_INSTRUCTION, BODY_MARKER, stdinLine } from '../lib/agent-file.mjs';
-import { humanError, parseAgyError, msixHint, MSIX_HINT } from '../lib/errors.mjs';
-import { parseModelList, estimateTokens, CONTENT_FILTER_RE, withoutThinking, visibleCounter, tokenWeight, resolveAgyPath, agyMissLine, leadingThinkStripper, redactAgyLog, maskHome } from '../lib/agy.mjs';
+import { humanError, parseAgyError, msixHint, MSIX_HINT, MSIX_HINT_SHORT } from '../lib/errors.mjs';
+import { parseModelList, estimateTokens, CONTENT_FILTER_RE, withoutThinking, visibleCounter, tokenWeight, resolveAgyPath, agyMissLine, findVirtualizedAgy, leadingThinkStripper, redactAgyLog, maskHome } from '../lib/agy.mjs';
 import { loadConfig, applyRuntimePatch, publicConfig, DEFAULTS } from '../lib/config.mjs';
 
 const sys = c => ({ role: 'system', content: c });
@@ -292,16 +292,57 @@ test('msixHint: ENOENT under AppData\\Local (either slash, any case) → the hin
   assert.equal(msixHint([{ path: null, code: 'ENOENT' }]), null);
   assert.equal(msixHint([]), null);
   assert.equal(msixHint(undefined), null);
-  assert.match(MSIX_HINT, /Claude 桌面版/); assert.match(MSIX_HINT, /explorer\.exe/); assert.match(MSIX_HINT, /MSIX 封裝 App 的檔案虛擬化/);   // README heading it points to
+  for (const h of [MSIX_HINT, MSIX_HINT_SHORT]) {
+    assert.match(h, /Claude 桌面版/); assert.match(h, /MSIX 封裝/); assert.match(h, /explorer\.exe/); assert.match(h, /MSIX 封裝 App 的檔案虛擬化/);   // README heading it points to
+    assert.doesNotMatch(h, /商店版/);   // the Claude desktop app is an MSIX download, not a Store install — "商店版" alone would let that player think "not me"
+  }
+  assert.ok(MSIX_HINT_SHORT.length < MSIX_HINT.length);
+  assert.equal(msixHint([{ path: local, code: 'ENOENT' }], null, { short: true }), MSIX_HINT_SHORT);
 });
 
-test('humanError: spawn ENOENT on a full agyPath under AppData\\Local → agyPath advice, then the MSIX hint', () => {
+test('msixHint with the agy actually found in an app drawer → names the app and the real location; nothing when the attempts do not fit', () => {
+  const local = String.raw`C:\Users\Someone\AppData\Local\agy\bin\agy.exe`;
+  const found = { package: 'Claude_pzs8sxrjxfjjc', path: String.raw`C:\Users\Someone\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\agy\bin\agy.exe` };
+  const long = msixHint([{ path: local, code: 'ENOENT' }], found);
+  assert.match(long, /agy 其實在 Claude_pzs8sxrjxfjjc 這個 App 的私人抽屜裡/); assert.ok(long.includes(found.path), long);
+  assert.match(long, /explorer\.exe/); assert.match(long, /MSIX 封裝 App 的檔案虛擬化/); assert.doesNotMatch(long, /若是/);   // no longer conditional
+  const short = msixHint([{ path: local, code: 'ENOENT' }], found, { short: true });
+  assert.ok(short.includes(found.path) && short.length < long.length, short);
+  assert.equal(msixHint([{ path: String.raw`D:\tools\agy.exe`, code: 'ENOENT' }], found), null);   // the drawer alone does not explain a D:\ path
+});
+
+test('findVirtualizedAgy: %LOCALAPPDATA%\\Packages\\<app>\\LocalCache\\Local\\agy\\bin\\agy.exe → { package, path }; otherwise null', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mint-drawer-'));
+  try {
+    assert.equal(findVirtualizedAgy({}), null);                                            // no LOCALAPPDATA
+    assert.equal(findVirtualizedAgy({ LOCALAPPDATA: path.join(root, 'nope') }), null);      // no Packages folder
+    fs.mkdirSync(path.join(root, 'Packages', 'Other_abc', 'LocalCache', 'Local'), { recursive: true });
+    assert.equal(findVirtualizedAgy({ LOCALAPPDATA: root }), null);                         // packages without agy
+    const bin = path.join(root, 'Packages', 'Claude_abc123', 'LocalCache', 'Local', 'agy', 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.mkdirSync(path.join(bin, 'agy.exe'));                                                // a folder named agy.exe is not it
+    assert.equal(findVirtualizedAgy({ LOCALAPPDATA: root }), null);
+    fs.rmdirSync(path.join(bin, 'agy.exe'));
+    fs.writeFileSync(path.join(bin, 'agy.exe'), 'MZ');
+    assert.deepEqual(findVirtualizedAgy({ LOCALAPPDATA: root }), { package: 'Claude_abc123', path: path.join(bin, 'agy.exe') });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('humanError: spawn ENOENT on a full agyPath under AppData\\Local → agyPath advice, then the (short) MSIX hint', () => {
   const p = String.raw`C:\Users\Someone\AppData\Local\agy\bin\agy.exe`;
   const t = humanError(Object.assign(new Error(`spawn ${p} ENOENT`), { code: 'ENOENT', syscall: `spawn ${p}`, path: p }));
-  assert.match(t, /找不到 agy 程式/); assert.match(t, /Claude 桌面版/);
+  assert.match(t, /找不到 agy 程式/); assert.ok(t.includes(MSIX_HINT_SHORT), t);
   assert.ok(t.indexOf('agyPath') < t.indexOf('Claude 桌面版') && t.indexOf('Claude 桌面版') < t.indexOf('原始錯誤'), t);
   const other = String.raw`D:\tools\agy\agy.exe`;
   assert.doesNotMatch(humanError(Object.assign(new Error(`spawn ${other} ENOENT`), { code: 'ENOENT', syscall: `spawn ${other}`, path: other })), /Claude 桌面版/);
+});
+
+test('humanError: the bridge\'s own verdict (ctx.msixHint) wins — the no-agyPath case spawns a bare "agy.exe" that says nothing about AppData', () => {
+  const e = () => Object.assign(new Error('spawn agy.exe ENOENT'), { code: 'ENOENT', syscall: 'spawn agy.exe', path: 'agy.exe' });
+  assert.doesNotMatch(humanError(e()), /Claude 桌面版/);
+  assert.ok(humanError(e(), { msixHint: MSIX_HINT_SHORT }).includes(MSIX_HINT_SHORT));
+  assert.match(humanError(e(), { msixHint: 'agy 其實在 X 這個 App 的私人抽屜裡（P）；請…' }), /私人抽屜裡（P）/);
+  assert.doesNotMatch(humanError(e(), { msixHint: null }), /Claude 桌面版/);   // agy was fine at the last check: judge from the path alone
 });
 
 test('config: stallSec clamps to 0..3600 (0 = off) and is a runtime key', () => {

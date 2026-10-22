@@ -4,9 +4,11 @@
 
 一件事：叫 Claude 桌面版幫你裝的 agy，酒館看不到。升級照 README 的「升級三步」：`git pull`、看這段、重啟酒館。沒有要改的設定。
 
-- **找不到 agy 時多一句提示**：找不到 agy（`ENOENT`）、而且找過的路徑在 `AppData\Local` 底下時，狀態頁的 `warnings`（排在「填 agyPath」那句後面）、酒館啟動時的主控台，以及送訊息時跳的錯誤通知，都多一句「若是叫 Claude 桌面版或其他商店版 App 幫你裝的 agy，請在自己的終端機重裝一次」。原因：Claude 桌面版（Windows）是 MSIX 封裝的 App，它跟它開出來的每個程序寫進 `%LOCALAPPDATA%` 的檔案，會被 Windows 轉到 `AppData\Local\Packages\Claude_<id>\LocalCache\Local\` 底下，只有它們自己看得到——在 Claude 裡跑 `install.ps1` 裝的 agy 就住在那裡，從桌面點開的酒館當然找不到，`agyPath` 填完整路徑也一樣。別的原因的 `ENOENT`（例如 `agyPath` 指到 D 槽一個不存在的檔）和別的錯誤碼（`EBUSY`、`EPERM`）不會多這句。
+- **找不到 agy 時多一句提示**：找不到 agy（`ENOENT`）、而且找過的路徑在 `AppData\Local` 底下時，狀態頁的 `warnings`（排在「填 agyPath」那句後面）、酒館啟動時的主控台，以及送訊息時跳的紅色通知（通知用短版），都多一句「若是叫 Claude 桌面版這類 MSIX 封裝的 App 幫你裝的 agy，請在自己的終端機重裝一次」。原因：Claude 桌面版（Windows）是 MSIX 封裝的 App（官網下載的也是，不只商店版），它跟它開出來的每個程序寫進 `%LOCALAPPDATA%` 的檔案，會被 Windows 轉到 `AppData\Local\Packages\Claude_<id>\LocalCache\Local\` 底下，只有它們自己看得到——在 Claude 裡跑 `install.ps1` 裝的 agy 就住在那裡，從桌面點開的酒館當然找不到，`agyPath` 填完整路徑也一樣。Windows 的預設位置本來就在 `AppData\Local` 底下，所以 Windows 上只要找不到 agy 幾乎都會看到這句「若是…」（沒裝的人也會，當提醒就好）；`agyPath` 指到別處（例如 D 槽）的 `ENOENT`、別的錯誤碼（`EBUSY`、`EPERM`）、macOS／Linux 不會多這句。
+- **橋會自己去 App 的抽屜找**：那個抽屜（`%LOCALAPPDATA%\Packages\<App>\LocalCache\Local\agy\bin\agy.exe`）從外面讀得到。找不到 agy 時橋會翻一遍，真的找到就不再說「若是」，改成直接寫「agy 其實在 ○○ 這個 App 的私人抽屜裡（完整路徑）」，狀態頁的 `agy.hiddenIn` 也列出那個路徑。
+- 找不到 agy 時，狀態頁不再把「模型清單拿不到」那句也列進去（它跟上面兩句講的是同一件事，以前會重複）。
 - README 補「MSIX 封裝 App 的檔案虛擬化」一段：白話原因、判法（在 Claude 外面自己開的終端機看 `%LOCALAPPDATA%\agy\bin` 有沒有 agy.exe）、修法（自己的終端機重跑 `install.ps1`；要讓 AI 裝就叫它用 `explorer.exe` 借桌面身分跑）。安裝第 1 步加一句「在你自己開的終端機跑」。
-- agy 1.4.4 列進驗過的版本（這版的真機測試跑在 1.4.4 上：flash-low 非串流與串流各一發正常）。
+- agy 1.4.4、1.4.5 列進驗過的版本（這版的真機測試先跑在 1.4.4、收尾時這台已自動更新到 1.4.5 再各補一輪：flash-low 非串流與串流各一發正常）。
 - 出處：朔牽星 26-10-21 在亭仔腳破案——同一支程式從 Claude 的殼跑 `stat` 成功、用 `explorer.exe` 借桌面身分跑就 `ENOENT`；用 `explorer.exe` 重跑 `install.ps1` 後，從桌面開的酒館就看得到 agy 了。0.1.2 的「隔 5 秒再找」和狀態頁重查對這個情境都正確地失敗了：對那個程序來說檔案真的不存在。
 
 ## 0.1.2（2026-10-20）

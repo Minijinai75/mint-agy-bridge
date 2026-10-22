@@ -134,7 +134,7 @@ git clone https://github.com/Minijinai75/mint-agy-bridge.git
 
 **症狀**：agy 明明「裝好了」、在 Claude 桌面版裡面叫得動，但從桌面點開的酒館一直說找不到 agy；`config.json` 的 `agyPath` 填了完整路徑也一樣 `ENOENT`。從 Claude 裡面開的酒館卻正常。
 
-**原因**：Claude 桌面版（Windows）是 **MSIX 封裝**的 App（微軟商店那種包法）。這類 App、以及它開出來的所有子程序（包括你在裡面叫 AI 開的 PowerShell），寫進 `%LOCALAPPDATA%` 的檔案會被 Windows 悄悄轉存到 `%LOCALAPPDATA%\Packages\Claude_<一串代碼>\LocalCache\Local\` 底下——這叫「檔案虛擬化」。對那個 App 來說路徑看起來沒變、檔案都在；對別的程式來說，同一個路徑是空的。所以在 Claude 裡跑 `install.ps1` 裝的 agy，其實住進了 Claude 的私人抽屜，只有 Claude 跟它開出來的程式看得到；安裝器加進 PATH 的那一筆也在抽屜裡，桌面上的 PATH 一樣沒有 agy。agy 的登入不受影響（`~/.gemini` 不在虛擬化的範圍）。橋 0.1.2 的「隔 5 秒再找」和狀態頁重查在這個情境下都會正確地失敗：對酒館那個程序來說，檔案真的不存在。
+**原因**：Claude 桌面版（Windows）是 **MSIX 封裝**的 App——微軟商店那種包法，但不是只有商店裝的才算，官網下載的 Claude 安裝檔也是這種包法。這類 App、以及它開出來的所有子程序（包括你在裡面叫 AI 開的 PowerShell），在 `%LOCALAPPDATA%` 底下新建的檔案會被 Windows 悄悄轉存到 `%LOCALAPPDATA%\Packages\Claude_<一串代碼>\LocalCache\Local\` 底下——這叫「檔案虛擬化」。對那個 App 來說路徑看起來沒變、檔案都在；對別的程式來說，同一個路徑是空的。所以在 Claude 裡跑 `install.ps1` 裝的 agy，其實住進了 Claude 的私人抽屜，只有 Claude 跟它開出來的程式看得到；就算 PATH 裡有 agy 那一筆，它指向的資料夾從桌面看也是空的。agy 的設定與登入放在 `~/.gemini`，不在虛擬化的範圍，朔牽星重裝後沒有重新登入；真要你登入就照畫面登入一次。橋 0.1.2 的「隔 5 秒再找」和狀態頁重查在這個情境下都會正確地失敗：對酒館那個程序來說，檔案真的不存在。
 
 **判法**：在 Claude **外面**、自己開的終端機（開始功能表 → PowerShell）跑：
 
@@ -143,11 +143,11 @@ dir $env:LOCALAPPDATA\agy\bin\agy.exe
 dir $env:LOCALAPPDATA\Packages\Claude_*\LocalCache\Local\agy\bin\agy.exe
 ```
 
-第一行紅字說找不到、第二行卻列出了 `agy.exe`，就是這個問題。（cmd 的寫法：`dir %LOCALAPPDATA%\agy\bin`。）第二行也紅字＝agy 不在 Claude 的抽屜裡，是別的原因，回上面那張表。
+第一行紅字說找不到、第二行卻列出了 `agy.exe`，就是這個問題。（cmd 的寫法：`dir %LOCALAPPDATA%\agy\bin`。）第二行**什麼都沒印**（路徑帶 `*` 時對不到不會紅字，只是沒輸出）＝agy 不在 Claude 的抽屜裡，是別的原因，回上面那張表。0.1.3 起橋自己也會去各個 App 的抽屜找：找到了，狀態頁的警告會直接寫「agy 其實在 ○○ 這個 App 的私人抽屜裡（路徑）」，`agy.hiddenIn` 也會列出來，不用自己跑這兩行。
 
-**修法**：在自己開的終端機（不是 Claude 裡面那個）重跑一次第 1 步的安裝指令，agy 就會裝進真的 `%LOCALAPPDATA%`，不用重新登入；然後從桌面重開酒館。還是想叫 AI 替你裝的話，請它把安裝指令寫成一個 `.bat`，再用 `explorer.exe <那個 .bat 的完整路徑>` 開——借桌面（explorer）的身分跑，就不在 App 的抽屜裡了。
+**修法**：在自己開的終端機（不是 Claude 裡面那個）重跑一次第 1 步的安裝指令，agy 就會裝進真的 `%LOCALAPPDATA%`；然後從桌面重開酒館。還是想叫 AI 替你裝的話，請它把安裝指令寫成一個 `.bat`，再用 `explorer.exe <那個 .bat 的完整路徑>` 開——借桌面（explorer）的身分跑，就不在 App 的抽屜裡了。
 
-其他從微軟商店裝的 App 也可能是同樣的包法，判法一樣。0.1.3 起，找不到 agy 而且找過的路徑在 `AppData\Local` 底下時，狀態頁、主控台和錯誤通知會多提示這一句。（26-10-21 朔牽星在亭仔腳破案並實測修法，謝謝。）
+其他 MSIX 封裝的 App（微軟商店裝的多半是）也可能有同樣的包法，判法一樣。0.1.3 起，找不到 agy 而且找過的路徑在 `AppData\Local` 底下時，狀態頁、主控台和送訊息時的紅色通知會多提示這一句（Windows 的預設位置本來就在 `AppData\Local` 底下，所以沒裝 agy 的人也會看到這句「若是…」，當成提醒就好）；在某個 App 的抽屜裡真的找到 agy 時，提示會改成直接寫出它在哪。（26-10-21 朔牽星在亭仔腳破案並實測修法，謝謝。）
 
 ## 它怎麼運作、安全嗎
 
