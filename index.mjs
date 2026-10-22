@@ -15,8 +15,8 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, applyRuntimePatch, publicConfig, isLoopback } from './lib/config.mjs';
 import { parseMessages, textOf } from './lib/parse.mjs';
 import { planTurn, agentNameFor, renderAgentFile } from './lib/agent-file.mjs';
-import { humanError, msixHint } from './lib/errors.mjs';
-import { runTurn, fetchModels, agyVersion, readAgySettings, cleanupConversation, resolveAgyPath, agyMissLine, findVirtualizedAgy, leadingThinkStripper, redactAgyLog, maskHome } from './lib/agy.mjs';
+import { humanError, msixHint, agyPathAdvice } from './lib/errors.mjs';
+import { runTurn, fetchModels, agyVersion, readAgySettings, cleanupConversation, resolveAgyPath, agyMissLine, findVirtualizedAgy, leadingThinkStripper, redactAgyLog, maskHome, platformOf } from './lib/agy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ID = 'mint-agy-bridge';
@@ -64,21 +64,23 @@ let agyCheckInflight = null;
 function checkAgy() {
   if (agyCheckInflight) return agyCheckInflight;
   agyCheckInflight = (async () => {
-    const misses = [];
+    const misses = [], platform = platformOf(cfg);
     agyInfo.path = resolveAgyPath(cfg, misses);
     const fellBack = !cfg.agyPath && misses.length && agyInfo.path === path.basename(agyInfo.path);
-    if (fellBack) console.warn(`${TAG} ${agyMissLine(misses)}`);
+    const missLine = () => agyMissLine(misses, process.env, process.cwd(), platform);
+    if (fellBack) console.warn(`${TAG} ${missLine()}`);
     agyInfo.settings = readAgySettings(cfg);
     const diag = {};
     agyInfo.version = await agyVersion(cfg, diag);
     agyInfo.versionTested = agyInfo.version ? TESTED_AGY_VERSIONS.includes(agyInfo.version) : null;
-    agyInfo.error = agyInfo.version ? null : `${diag.error || 'unknown'}${fellBack ? `｜${agyMissLine(misses)}` : ''}`;
-    // ENOENT under AppData\Local → maybe an agy installed from inside an MSIX app (see MSIX_HINT in errors.mjs);
-    // the app's drawer is readable from here, so look for it and name the real location when it is there.
+    agyInfo.error = agyInfo.version ? null : `${diag.error || 'unknown'}${fellBack ? `｜${missLine()}` : ''}`;
+    // Windows only — ENOENT under AppData\Local → maybe an agy installed from inside an MSIX app (see MSIX_HINT in
+    // errors.mjs); the app's drawer is readable from here, so look for it and name the real location when it is
+    // there. On macOS / Linux both calls answer null at once.
     const attempts = [...misses, { path: diag.path, code: diag.code }];
-    agyInfo.hiddenAgy = !agyInfo.version && msixHint(attempts) ? findVirtualizedAgy() : null;
-    agyInfo.hint = agyInfo.version ? null : msixHint(attempts, agyInfo.hiddenAgy);
-    agyInfo.hintShort = agyInfo.version ? null : msixHint(attempts, agyInfo.hiddenAgy, { short: true });
+    agyInfo.hiddenAgy = !agyInfo.version && msixHint(attempts, null, { platform }) ? findVirtualizedAgy(process.env, platform) : null;
+    agyInfo.hint = agyInfo.version ? null : msixHint(attempts, agyInfo.hiddenAgy, { platform });
+    agyInfo.hintShort = agyInfo.version ? null : msixHint(attempts, agyInfo.hiddenAgy, { short: true, platform });
     if (!agyInfo.version) console.warn(`${TAG} 叫不動 agy（${agyInfo.path}）：${agyInfo.error}`);
     else if (!models.list.length || models.error) await listModels({ refresh: true });
     agyInfo.checkedAt = Date.now();
@@ -106,7 +108,7 @@ function refreshModels() {
   models.inflight = (async () => {
     const { models: list, error } = await fetchModels(cfg);
     if (list.length) { models.list = list; models.at = Date.now(); models.error = null; models.failAt = 0; }
-    else { models.error = humanError(error); models.failAt = Date.now(); console.error(`${TAG} 模型清單拿不到：${models.error}`); }
+    else { models.error = humanError(error, { platform: platformOf(cfg) }); models.failAt = Date.now(); console.error(`${TAG} 模型清單拿不到：${models.error}`); }
     return models.list;   // keep the old list when a refresh fails
   })().finally(() => { models.inflight = null; });
   return models.inflight;
@@ -389,7 +391,7 @@ export async function handleChatCompletions(req, res) {
     if (!alive()) return;
     if (ticket.aborted) return replySuperseded(res, isStream, completionId, modelId);
 
-    const errText = r.ok ? null : humanError(r.error, { timedOut: r.timedOut, contentBlocked: r.contentBlocked, stalled: r.stalled, stallSec: r.stallSec, stalledBeforeText: r.stalledBeforeText, retried, timeoutSec: cfg.printTimeoutSec, elapsedSec: Math.round(r.ms / 1000), msixHint: agyInfo.hintShort });
+    const errText = r.ok ? null : humanError(r.error, { timedOut: r.timedOut, contentBlocked: r.contentBlocked, stalled: r.stalled, stallSec: r.stallSec, stalledBeforeText: r.stalledBeforeText, retried, timeoutSec: cfg.printTimeoutSec, elapsedSec: Math.round(r.ms / 1000), msixHint: agyInfo.hintShort, platform: platformOf(cfg) });
     if (!r.ok && !sentText) return fail(502, `薄荷橋：${errText}`);
     if (!isStream) return replyWhole(res, false, completionId, modelId, r.text, r.usage, r.finishReason);
     // Part of the reply already went out: keep it, and send the error as an error event (red notice).
@@ -400,9 +402,9 @@ export async function handleChatCompletions(req, res) {
     res.end();
   } catch (err) {
     console.error(`${TAG} 拋錯：${String(err?.stack || err).slice(0, 600)}`);
-    if (!res.headersSent) sendJson(res, 500, errorBody(`薄荷橋：${humanError(err)}`));
+    if (!res.headersSent) sendJson(res, 500, errorBody(`薄荷橋：${humanError(err, { platform: platformOf(cfg) })}`));
     else if (alive()) {
-      writeStreamError(res, `薄荷橋：${humanError(err)}`);
+      writeStreamError(res, `薄荷橋：${humanError(err, { platform: platformOf(cfg) })}`);
       res.write('data: [DONE]\n\n'); res.end();
     }
   } finally {
@@ -494,7 +496,7 @@ function replyWhole(res, isStream, id, model, text, usage, finishReason = 'stop'
 export function statusPayload() {
   const warnings = [];
   if (!agyInfo.version) {
-    warnings.push('找不到 agy 或讀不到版本：把 agy.exe 的完整路徑填進 config.json 的 agyPath（通常是 %LOCALAPPDATA%\\agy\\bin\\agy.exe），再重啟酒館；真的還沒裝才照 README 第 1 步裝。');
+    warnings.push(`找不到 agy 或讀不到版本：把 ${agyPathAdvice(platformOf(cfg))}，再重啟酒館；真的還沒裝才照 README 第 1 步裝。`);
     if (agyInfo.hint) warnings.push(agyInfo.hint);   // right after the agyPath advice: "fill agyPath" stays first (0.1.2)
   } else if (!agyInfo.versionTested) warnings.push(`agy ${agyInfo.version} 不在驗過的版本（${TESTED_AGY_VERSIONS.join('、')}）裡：大多照樣能用，有怪狀況請回報。`);
   if (configFileError) warnings.push(configFileError);

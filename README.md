@@ -1,5 +1,7 @@
 # 薄荷橋 Mint AGY Bridge
 
+> English version: [README.en.md](README.en.md)
+
 讓 SillyTavern（酒館）用你自己的 **Antigravity（反重力）** 帳號聊天：薄荷橋是一個酒館伺服器外掛，在本機開一個 OpenAI 相容的接口，背後呼叫 Google 官方的 Antigravity CLI（`agy`）。主力模型是 **Gemini 4 Argon**；實際能選哪些模型，看你的帳號與登入方式。
 
 > English summary: a SillyTavern server plugin exposing an OpenAI-compatible endpoint (`/v1/chat/completions`, streaming and non-streaming) backed by the official Antigravity CLI. Zero dependencies, Node 18+. Models are whatever `agy models` lists for your account.
@@ -22,7 +24,9 @@ irm https://antigravity.google/cli/install.ps1 | iex
 curl -fsSL https://antigravity.google/cli/install.sh | bash
 ```
 
-這行要在**你自己開的終端機**跑（開始功能表 → PowerShell 或 Windows Terminal）。叫 Claude 桌面版這類 App 裡的 AI 替你跑的話，agy 會被裝進那個 App 自己的抽屜、酒館看不到——為什麼、怎麼判、怎麼救，看下面的〔[MSIX 封裝 App 的檔案虛擬化](#msix-封裝-app-的檔案虛擬化叫-claude-桌面版幫你裝-agy-會撞到)〕。
+這行要在**你自己開的終端機**跑（Windows：開始功能表 → PowerShell 或 Windows Terminal）。Windows 上叫 Claude 桌面版這類 App 裡的 AI 替你跑的話，agy 會被裝進那個 App 自己的抽屜、酒館看不到——為什麼、怎麼判、怎麼救，看下面的〔[MSIX 封裝 App 的檔案虛擬化](#msix-封裝-app-的檔案虛擬化叫-claude-桌面版幫你裝-agy-會撞到)〕（只有 Windows 會撞到）。
+
+macOS／Linux：安裝腳本把 `agy` 放在 `~/.local/bin/agy`（照網路上的安裝教學；官方說明在 <https://antigravity.google/docs/install/>）。裝完**新開一個終端機**打 `agy --version`；說找不到指令就是 `~/.local/bin` 不在 PATH 裡，把 `export PATH="$HOME/.local/bin:$PATH"` 加進 `~/.bashrc` 或 `~/.zshrc`。酒館是從桌面捷徑、launchd 或 systemd 啟動的話，它看到的 PATH 常跟你終端機的不一樣，橋找不到 agy 時直接在 `config.json` 填 `agyPath`（下面有寫）最穩。
 
 **2. 登入 agy**
 
@@ -83,7 +87,7 @@ git clone https://github.com/Minijinai75/mint-agy-bridge.git
 | `port` | `5499` | 接口的埠號 |
 | `host` | `127.0.0.1` | 只給本機用。改成其他位址前請先設 `apiKey` |
 | `apiKey` | 空 | 設了之後酒館的 API Key 欄要填同一串 |
-| `agyPath` | 自動找 | 狀態頁說找不到 agy 時填完整路徑。Windows 預設裝在這裡，可以直接照抄：`"agyPath": "%LOCALAPPDATA%\\agy\\bin\\agy.exe"`（JSON 裡反斜線要寫兩個；`%LOCALAPPDATA%` 這種寫法 0.1.2 起橋會自己展開） |
+| `agyPath` | 自動找 | 狀態頁說找不到 agy 時填完整路徑。Windows 預設裝在這裡，可以直接照抄：`"agyPath": "%LOCALAPPDATA%\\agy\\bin\\agy.exe"`（JSON 裡反斜線要寫兩個；`%LOCALAPPDATA%` 這種寫法 0.1.2 起橋會自己展開）。macOS／Linux 在終端機打 `which agy`，把印出來的路徑照抄，例如 `"agyPath": "~/.local/bin/agy"`（開頭的 `~` 0.1.4 起橋會自己展開成家目錄） |
 | `adcAuth` | `false` | 用 ADC 登入時設 `true` |
 | `defaultModel` | 空 | 請求沒指定模型時用哪顆；空＝清單第一顆 |
 | `printTimeoutSec` | `900` | 一則最多等幾秒（0.1.0 是 300，慢模型配長對話不夠用）。`argon-high` 配長歷史可以再調大 |
@@ -99,7 +103,19 @@ git clone https://github.com/Minijinai75/mint-agy-bridge.git
 | `maxConcurrent` | `2` | 不同對話最多同時生幾則 |
 | `usageLog` | `true` | 在 `usage/` 記 token 數（不記內容） |
 
-狀態頁：`http://127.0.0.1:5499/status`（agy 版本、模型清單、警告）。設了 `apiKey` 之後狀態頁也要帶金鑰，用 `curl -H "Authorization: Bearer 你的金鑰" http://127.0.0.1:5499/status` 看；或看酒館主控台裡 `[mint-agy-bridge]` 開頭的幾行。
+狀態頁：`http://127.0.0.1:5499/status`（agy 版本、模型清單、警告；`agy.path` 是橋實際找到、實際在跑的那一支）。設了 `apiKey` 之後狀態頁也要帶金鑰，用 `curl -H "Authorization: Bearer 你的金鑰" http://127.0.0.1:5499/status` 看；或看酒館主控台裡 `[mint-agy-bridge]` 開頭的幾行。
+
+### 橋怎麼找 agy（三個平台一樣的順序，位置不同）
+
+1. `config.json` 的 `agyPath`（有填就只用它，不再找別處；`%VAR%` 與開頭的 `~` 會展開）。
+2. PATH：酒館那個程序看到的 PATH 裡，第一個有 `agy`（Windows 是 `agy.exe`）的資料夾。
+3. 各平台安裝程式的預設位置，依序：
+   - Windows：`%LOCALAPPDATA%\agy\bin\agy.exe`
+   - Linux：`~/.local/bin/agy`、`/usr/local/bin/agy`、`~/.antigravity/bin/agy`
+   - macOS：`~/.local/bin/agy`、`/opt/homebrew/bin/agy`、`/usr/local/bin/agy`、`~/.antigravity/bin/agy`
+4. 都沒有就直接叫 `agy`（Windows 叫 `agy.exe`），讓作業系統再找一次 PATH；還是沒有，狀態頁和主控台會列出每個讀不到的預設位置與原因代碼。
+
+Windows 上找不到時，橋還會翻 MSIX 封裝 App 的抽屜（下面那段）；macOS／Linux 沒這回事，跳過不提。
 
 ## 常見錯誤
 
@@ -109,7 +125,7 @@ git clone https://github.com/Minijinai75/mint-agy-bridge.git
 
 | 看到 | 原因與處理 |
 |---|---|
-| 找不到 agy 程式／狀態頁說找不到 agy | 先在 `config.json` 填 `agyPath`（agy.exe 的完整路徑）再重啟酒館，這招最快。agy 明明裝好卻偶爾在酒館剛啟動時找不到（有玩家撞過兩次）：0.1.2 起橋會隔 5 秒再找、最多三次，打開狀態頁也會重找一次；主控台會印出那一刻讀不到的原因代碼（`ENOENT`、`EBUSY`、`EPERM`…），回報時附上。**agy 是叫 Claude 桌面版幫你裝的、`agyPath` 填了完整路徑還是 `ENOENT`**：看下面的〔MSIX 封裝 App 的檔案虛擬化〕，0.1.3 起狀態頁會多提示這一句。真的沒裝才回第 1 步 |
+| 找不到 agy 程式／狀態頁說找不到 agy | 先在 `config.json` 填 `agyPath`（Windows 是 agy.exe 的完整路徑；macOS／Linux 在終端機打 `which agy` 照抄，通常是 `~/.local/bin/agy`）再重啟酒館，這招最快。macOS／Linux 常見原因是酒館從桌面或服務啟動、看到的 PATH 沒有 `~/.local/bin`，填 `agyPath` 就繞過去了。agy 明明裝好卻偶爾在酒館剛啟動時找不到（有玩家撞過兩次）：0.1.2 起橋會隔 5 秒再找、最多三次，打開狀態頁也會重找一次；主控台會印出那一刻讀不到的原因代碼（`ENOENT`、`EBUSY`、`EPERM`…），回報時附上。**Windows、agy 是叫 Claude 桌面版幫你裝的、`agyPath` 填了完整路徑還是 `ENOENT`**：看下面的〔MSIX 封裝 App 的檔案虛擬化〕，0.1.3 起狀態頁會多提示這一句。真的沒裝才回第 1 步 |
 | 模型那頭 N 秒沒出字 | 回覆停住不動（生到一半，或一個字都還沒出），不是逾時，也不是橋壞了。通知裡寫「已經自動重送過一次」的，表示重送那發也卡住了；等一兩分鐘再按重新生成，一直這樣就換模型 |
 | 模型不在你 agy 帳號的清單裡 | 你的登入方式看不到這顆。重新整理酒館的模型清單再選 |
 | Google Cloud 專案的配額不夠（429） | 到 Google Cloud 主控台「配額」頁替那顆模型申請提高，或換模型 |
@@ -132,6 +148,8 @@ git clone https://github.com/Minijinai75/mint-agy-bridge.git
 
 ### MSIX 封裝 App 的檔案虛擬化（叫 Claude 桌面版幫你裝 agy 會撞到）
 
+只有 Windows 會撞到這個：MSIX 與檔案虛擬化是 Windows 的機制，macOS／Linux 沒有這回事，橋在那兩個平台也不會提示這一句、不會去翻抽屜。
+
 **症狀**：agy 明明「裝好了」、在 Claude 桌面版裡面叫得動，但從桌面點開的酒館一直說找不到 agy；`config.json` 的 `agyPath` 填了完整路徑也一樣 `ENOENT`。從 Claude 裡面開的酒館卻正常。
 
 **原因**：Claude 桌面版（Windows）是 **MSIX 封裝**的 App——微軟商店那種包法，但不是只有商店裝的才算，官網下載的 Claude 安裝檔也是這種包法。這類 App、以及它開出來的所有子程序（包括你在裡面叫 AI 開的 PowerShell），在 `%LOCALAPPDATA%` 底下新建的檔案會被 Windows 悄悄轉存到 `%LOCALAPPDATA%\Packages\Claude_<一串代碼>\LocalCache\Local\` 底下——這叫「檔案虛擬化」。對那個 App 來說路徑看起來沒變、檔案都在；對別的程式來說，同一個路徑是空的。所以在 Claude 裡跑 `install.ps1` 裝的 agy，其實住進了 Claude 的私人抽屜，只有 Claude 跟它開出來的程式看得到；就算 PATH 裡有 agy 那一筆，它指向的資料夾從桌面看也是空的。agy 的設定與登入放在 `~/.gemini`，不在虛擬化的範圍，朔牽星重裝後沒有重新登入；真要你登入就照畫面登入一次。橋 0.1.2 的「隔 5 秒再找」和狀態頁重查在這個情境下都會正確地失敗：對酒館那個程序來說，檔案真的不存在。
@@ -153,6 +171,7 @@ dir $env:LOCALAPPDATA\Packages\Claude_*\LocalCache\Local\agy\bin\agy.exe
 
 - 每一則：把角色卡、預設和整段對話寫成一個暫時的 agy「自訂代理」檔（拿掉 agy 內建的寫程式提示、**不給任何工具**），只把你最新那句從標準輸入送進去，生完就刪檔。為什麼這樣排：agy 會把超過約 19.2 萬位元組的使用者訊息從尾端默默切掉，代理檔則實測 39 萬位元組完整。你貼的單則訊息太長時，橋也會把它挪進代理檔。細節看 [docs/DESIGN.md](docs/DESIGN.md)。
 - 每一發都帶 `--sandbox`、不帶 `--dangerously-skip-permissions`；agy 若想動用工具，無人值守模式會自動拒絕，橋會在主控台記警告。
+- 橋停掉一發 agy 時（卡住、逾時、被新請求取代），連它開出來的子程序一起停：Windows 用 `taskkill /T`，macOS／Linux 把 agy 放在自己的 process group 裡整組送 SIGTERM（0.1.4 起）。
 - 只聽 `127.0.0.1`，而且擋掉瀏覽器網頁偷送的請求（POST 只收 JSON、Host 必須是本機名稱）；`host` 改成別的位址時沒設 `apiKey` 橋不會啟動。不碰你的 agy 登入，也不改 agy 設定。
 - 角色卡裡寫 `@檔案路徑` 不會被 agy 展開成檔案內容（實測模型只看到路徑字串），第三方角色卡讀不到你的檔案。
 - **本機留下的東西**：每則生完，橋會刪掉 agy 為這段對話建的對話庫、逐字稿、註記和鎖檔。但 agy 有兩個所有對話共用的摘要檔（`~/.gemini/antigravity-cli/conversation_summaries.db`、`jetbox_summaries_proto.pb`），實測裡面會留下你送出的那句話（角色卡與歷史沒有）。這兩個檔你平常用 agy 也在用，橋不動它們；介意的話自己在 agy 裡清。

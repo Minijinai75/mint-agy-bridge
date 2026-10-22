@@ -6,8 +6,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { planTurn, renderAgentFile, agentNameFor, LONG_MESSAGE_POINTER, CONTINUE_POINTER, CONTINUE_INSTRUCTION, BODY_MARKER, stdinLine } from '../lib/agent-file.mjs';
-import { humanError, parseAgyError, msixHint, MSIX_HINT, MSIX_HINT_SHORT } from '../lib/errors.mjs';
-import { parseModelList, estimateTokens, CONTENT_FILTER_RE, withoutThinking, visibleCounter, tokenWeight, resolveAgyPath, agyMissLine, findVirtualizedAgy, leadingThinkStripper, redactAgyLog, maskHome } from '../lib/agy.mjs';
+import { humanError, parseAgyError, msixHint, MSIX_HINT, MSIX_HINT_SHORT, agyPathAdvice } from '../lib/errors.mjs';
+import { parseModelList, estimateTokens, CONTENT_FILTER_RE, withoutThinking, visibleCounter, tokenWeight, resolveAgyPath, agyMissLine, findVirtualizedAgy, leadingThinkStripper, redactAgyLog, maskHome, agyCandidates, agyCommandName, findOnPath, expandPath } from '../lib/agy.mjs';
 import { loadConfig, applyRuntimePatch, publicConfig, DEFAULTS } from '../lib/config.mjs';
 
 const sys = c => ({ role: 'system', content: c });
@@ -249,18 +249,20 @@ test('withoutThinking: closed blocks, an unclosed block (still thinking), any ca
   assert.equal(withoutThinking('沒有思考段的故事'), '沒有思考段的故事');
 });
 
-test('resolveAgyPath: a default location that cannot be read is reported with its error code', { skip: process.platform !== 'win32' }, () => {
-  const saved = process.env.LOCALAPPDATA;
-  process.env.LOCALAPPDATA = path.join(os.tmpdir(), `mint-no-such-dir-${process.pid}`);
-  try {
-    const misses = [];
-    assert.equal(resolveAgyPath({}, misses), 'agy.exe');
-    assert.equal(misses.length, 1);
-    assert.equal(misses[0].code, 'ENOENT');
-    const line = agyMissLine(misses, process.env, String.raw`C:\ST`);
-    assert.match(line, /ENOENT/); assert.match(line, /LOCALAPPDATA=.*mint-no-such-dir/); assert.ok(line.includes(String.raw`cwd=C:\ST`), line);
-    assert.match(agyMissLine(misses, {}, 'x'), /LOCALAPPDATA=（沒設）/);
-  } finally { process.env.LOCALAPPDATA = saved; }
+// The Windows branch, run on whatever OS runs the suite (0.1.4: platform, env and home are injected).
+test('resolveAgyPath: a default location that cannot be read is reported with its error code', () => {
+  const env = { LOCALAPPDATA: path.join(os.tmpdir(), `mint-no-such-dir-${process.pid}`), PATH: '' };
+  const misses = [];
+  assert.equal(resolveAgyPath({}, misses, { platform: 'win32', env }), 'agy.exe');
+  assert.equal(misses.length, 1);
+  assert.equal(misses[0].code, 'ENOENT');
+  assert.ok(misses[0].path.endsWith(path.join('agy', 'bin', 'agy.exe')), misses[0].path);
+  const line = agyMissLine(misses, env, String.raw`C:\ST`, 'win32');
+  assert.match(line, /ENOENT/); assert.match(line, /LOCALAPPDATA=.*mint-no-such-dir/); assert.ok(line.includes(String.raw`cwd=C:\ST`), line);
+  assert.match(agyMissLine(misses, {}, 'x', 'win32'), /LOCALAPPDATA=（沒設）/);
+  // macOS / Linux: HOME instead of LOCALAPPDATA
+  const nix = agyMissLine([{ path: '/home/someone/.local/bin/agy', code: 'ENOENT' }], { HOME: '/home/someone' }, '/st', 'linux');
+  assert.match(nix, /HOME=\/home\/someone/); assert.match(nix, /cwd=\/st/); assert.doesNotMatch(nix, /LOCALAPPDATA/);
 });
 
 test('humanError: stalled → "模型那頭 N 秒沒出字", says whether it was already sent again', () => {
@@ -279,62 +281,67 @@ test('humanError: agy not found → fill agyPath comes first, reinstall last', (
 // 26-10-21 朔牽星: agy installed from inside the Claude desktop app (MSIX) lives in that app's private
 // LocalCache and is ENOENT for everyone else. The hint fits only ENOENT on a path under AppData\Local.
 test('msixHint: ENOENT under AppData\\Local (either slash, any case) → the hint; other paths or codes → nothing', () => {
+  const W = { platform: 'win32' };   // the hint is judged for Windows here; off Windows it is always null (tested below)
   const local = String.raw`C:\Users\Someone\AppData\Local\agy\bin\agy.exe`;
-  assert.equal(msixHint([{ path: local, code: 'ENOENT' }]), MSIX_HINT);
-  assert.equal(msixHint([{ path: 'C:/Users/Someone/AppData/Local/agy/bin/agy.exe', code: 'ENOENT' }]), MSIX_HINT);
-  assert.equal(msixHint([{ path: local.toUpperCase(), code: 'ENOENT' }]), MSIX_HINT);
-  assert.equal(msixHint([{ path: String.raw`D:\tools\agy.exe`, code: 'ENOENT' }, { path: local, code: 'ENOENT' }]), MSIX_HINT);   // any attempt fits
-  assert.equal(msixHint([{ path: local, code: 'EBUSY' }]), null);
-  assert.equal(msixHint([{ path: local, code: 'EPERM' }]), null);
-  assert.equal(msixHint([{ path: String.raw`D:\tools\agy.exe`, code: 'ENOENT' }]), null);
-  assert.equal(msixHint([{ path: '/home/someone/.local/bin/agy', code: 'ENOENT' }]), null);
-  assert.equal(msixHint([{ path: 'agy.exe', code: 'ENOENT' }]), null);
-  assert.equal(msixHint([{ path: null, code: 'ENOENT' }]), null);
-  assert.equal(msixHint([]), null);
-  assert.equal(msixHint(undefined), null);
+  assert.equal(msixHint([{ path: local, code: 'ENOENT' }], null, W), MSIX_HINT);
+  assert.equal(msixHint([{ path: 'C:/Users/Someone/AppData/Local/agy/bin/agy.exe', code: 'ENOENT' }], null, W), MSIX_HINT);
+  assert.equal(msixHint([{ path: local.toUpperCase(), code: 'ENOENT' }], null, W), MSIX_HINT);
+  assert.equal(msixHint([{ path: String.raw`D:\tools\agy.exe`, code: 'ENOENT' }, { path: local, code: 'ENOENT' }], null, W), MSIX_HINT);   // any attempt fits
+  assert.equal(msixHint([{ path: local, code: 'EBUSY' }], null, W), null);
+  assert.equal(msixHint([{ path: local, code: 'EPERM' }], null, W), null);
+  assert.equal(msixHint([{ path: String.raw`D:\tools\agy.exe`, code: 'ENOENT' }], null, W), null);
+  assert.equal(msixHint([{ path: '/home/someone/.local/bin/agy', code: 'ENOENT' }], null, W), null);
+  assert.equal(msixHint([{ path: 'agy.exe', code: 'ENOENT' }], null, W), null);
+  assert.equal(msixHint([{ path: null, code: 'ENOENT' }], null, W), null);
+  assert.equal(msixHint([], null, W), null);
+  assert.equal(msixHint(undefined, null, W), null);
   for (const h of [MSIX_HINT, MSIX_HINT_SHORT]) {
     assert.match(h, /Claude 桌面版/); assert.match(h, /MSIX 封裝/); assert.match(h, /explorer\.exe/); assert.match(h, /MSIX 封裝 App 的檔案虛擬化/);   // README heading it points to
     assert.doesNotMatch(h, /商店版/);   // the Claude desktop app is an MSIX download, not a Store install — "商店版" alone would let that player think "not me"
   }
   assert.ok(MSIX_HINT_SHORT.length < MSIX_HINT.length);
-  assert.equal(msixHint([{ path: local, code: 'ENOENT' }], null, { short: true }), MSIX_HINT_SHORT);
+  assert.equal(msixHint([{ path: local, code: 'ENOENT' }], null, { short: true, ...W }), MSIX_HINT_SHORT);
 });
 
 test('msixHint with the agy actually found in an app drawer → names the app and the real location; nothing when the attempts do not fit', () => {
   const local = String.raw`C:\Users\Someone\AppData\Local\agy\bin\agy.exe`;
   const found = { package: 'Claude_pzs8sxrjxfjjc', path: String.raw`C:\Users\Someone\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\agy\bin\agy.exe` };
-  const long = msixHint([{ path: local, code: 'ENOENT' }], found);
+  const W = { platform: 'win32' };
+  const long = msixHint([{ path: local, code: 'ENOENT' }], found, W);
   assert.match(long, /agy 其實在 Claude_pzs8sxrjxfjjc 這個 App 的私人抽屜裡/); assert.ok(long.includes(found.path), long);
   assert.match(long, /explorer\.exe/); assert.match(long, /MSIX 封裝 App 的檔案虛擬化/); assert.doesNotMatch(long, /若是/);   // no longer conditional
-  const short = msixHint([{ path: local, code: 'ENOENT' }], found, { short: true });
+  const short = msixHint([{ path: local, code: 'ENOENT' }], found, { short: true, ...W });
   assert.ok(short.includes(found.path) && short.length < long.length, short);
-  assert.equal(msixHint([{ path: String.raw`D:\tools\agy.exe`, code: 'ENOENT' }], found), null);   // the drawer alone does not explain a D:\ path
+  assert.equal(msixHint([{ path: String.raw`D:\tools\agy.exe`, code: 'ENOENT' }], found, W), null);   // the drawer alone does not explain a D:\ path
 });
 
 test('findVirtualizedAgy: %LOCALAPPDATA%\\Packages\\<app>\\LocalCache\\Local\\agy\\bin\\agy.exe → { package, path }; otherwise null', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mint-drawer-'));
   try {
-    assert.equal(findVirtualizedAgy({}), null);                                            // no LOCALAPPDATA
-    assert.equal(findVirtualizedAgy({ LOCALAPPDATA: path.join(root, 'nope') }), null);      // no Packages folder
+    const W = 'win32';   // the drawer is a Windows thing; the lookup is run as Windows on whatever OS runs the suite
+    assert.equal(findVirtualizedAgy({}, W), null);                                            // no LOCALAPPDATA
+    assert.equal(findVirtualizedAgy({ LOCALAPPDATA: path.join(root, 'nope') }, W), null);      // no Packages folder
     fs.mkdirSync(path.join(root, 'Packages', 'Other_abc', 'LocalCache', 'Local'), { recursive: true });
-    assert.equal(findVirtualizedAgy({ LOCALAPPDATA: root }), null);                         // packages without agy
+    assert.equal(findVirtualizedAgy({ LOCALAPPDATA: root }, W), null);                         // packages without agy
     const bin = path.join(root, 'Packages', 'Claude_abc123', 'LocalCache', 'Local', 'agy', 'bin');
     fs.mkdirSync(bin, { recursive: true });
     fs.mkdirSync(path.join(bin, 'agy.exe'));                                                // a folder named agy.exe is not it
-    assert.equal(findVirtualizedAgy({ LOCALAPPDATA: root }), null);
+    assert.equal(findVirtualizedAgy({ LOCALAPPDATA: root }, W), null);
     fs.rmdirSync(path.join(bin, 'agy.exe'));
     fs.writeFileSync(path.join(bin, 'agy.exe'), 'MZ');
-    assert.deepEqual(findVirtualizedAgy({ LOCALAPPDATA: root }), { package: 'Claude_abc123', path: path.join(bin, 'agy.exe') });
+    assert.deepEqual(findVirtualizedAgy({ LOCALAPPDATA: root }, W), { package: 'Claude_abc123', path: path.join(bin, 'agy.exe') });
+    assert.equal(findVirtualizedAgy({ LOCALAPPDATA: root }, 'linux'), null);                   // the same drawer says nothing off Windows
+    assert.equal(findVirtualizedAgy({ LOCALAPPDATA: root }, 'darwin'), null);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('humanError: spawn ENOENT on a full agyPath under AppData\\Local → agyPath advice, then the (short) MSIX hint', () => {
   const p = String.raw`C:\Users\Someone\AppData\Local\agy\bin\agy.exe`;
-  const t = humanError(Object.assign(new Error(`spawn ${p} ENOENT`), { code: 'ENOENT', syscall: `spawn ${p}`, path: p }));
+  const t = humanError(Object.assign(new Error(`spawn ${p} ENOENT`), { code: 'ENOENT', syscall: `spawn ${p}`, path: p }), { platform: 'win32' });
   assert.match(t, /找不到 agy 程式/); assert.ok(t.includes(MSIX_HINT_SHORT), t);
   assert.ok(t.indexOf('agyPath') < t.indexOf('Claude 桌面版') && t.indexOf('Claude 桌面版') < t.indexOf('原始錯誤'), t);
   const other = String.raw`D:\tools\agy\agy.exe`;
-  assert.doesNotMatch(humanError(Object.assign(new Error(`spawn ${other} ENOENT`), { code: 'ENOENT', syscall: `spawn ${other}`, path: other })), /Claude 桌面版/);
+  assert.doesNotMatch(humanError(Object.assign(new Error(`spawn ${other} ENOENT`), { code: 'ENOENT', syscall: `spawn ${other}`, path: other }), { platform: 'win32' }), /Claude 桌面版/);
 });
 
 test('humanError: the bridge\'s own verdict (ctx.msixHint) wins — the no-agyPath case spawns a bare "agy.exe" that says nothing about AppData', () => {
@@ -415,6 +422,12 @@ test('maskHome: the home folder in any spelling — slashes, JSON-doubled backsl
   assert.equal(maskHome('c:/users/someone/a', home), '~/a');
   assert.equal(maskHome(JSON.stringify({ p: String.raw`C:\Users\Someone\a` }), home), JSON.stringify({ p: String.raw`~\a` }));
   assert.equal(maskHome('nothing here', home), 'nothing here');
+  assert.equal(maskHome(String.raw`C:\Users\Someone2\a`, home), String.raw`C:\Users\Someone2\a`);   // another user's folder stays (it is masked elsewhere)
+  // macOS / Linux (0.1.4): the leading slash belongs to the match — "/~/x" is wrong; the name must end there; "root" inside a word is not /root
+  assert.equal(maskHome('/home/runner/.local/bin/agy', '/home/runner'), '~/.local/bin/agy');
+  assert.equal(maskHome('/HOME/RUNNER/x /home/runnerx', '/home/runner'), '~/x /home/runnerx');
+  assert.equal(maskHome(JSON.stringify({ p: '/Users/someone/a' }), '/Users/someone'), JSON.stringify({ p: '~/a' }));
+  assert.equal(maskHome('ENOENT spawn /root/agy rooted /root2/x "/root"', '/root'), 'ENOENT spawn ~/agy rooted /root2/x "~"');
 });
 
 test('visibleCounter: thinking past its limit counts again (an unclosed or mismatched tag cannot switch max_tokens off)', () => {
@@ -436,4 +449,106 @@ test('leadingThinkStripper: drops a leading thinking block (tags cut across piec
   assert.equal(run(['<b>粗體</b>開頭']), '<b>粗體</b>開頭');
   assert.equal(run(['<think>沒關上就結束']), '<think>沒關上就結束');   // shown, not hidden
   assert.equal(run(['正文 <think>中間的不動</think>']), '正文 <think>中間的不動</think>');
+});
+
+// ── 0.1.4: the lookup per platform, every branch run on whatever OS runs the suite ─
+const scratch = () => fs.mkdtempSync(path.join(os.tmpdir(), 'mint-lookup-'));
+const touch = (p, body = 'x') => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, body); };
+const exe = p => { touch(p, '#!/bin/sh\necho 1.4.2\n'); fs.chmodSync(p, 0o755); };   // the execute bit matters off Windows only
+const haveSystemAgy = () => ['/usr/local/bin/agy', '/opt/homebrew/bin/agy'].some(p => fs.existsSync(p));   // this machine's own agy would be found first
+
+test('agyCandidates: the installer defaults per platform, in order; the bare command name per platform', () => {
+  const home = path.join('/home', 'x'), env = { LOCALAPPDATA: path.join('C:', 'Users', 'x', 'AppData', 'Local') };
+  const local = path.join(home, '.local', 'bin', 'agy'), own = path.join(home, '.antigravity', 'bin', 'agy');
+  assert.deepEqual(agyCandidates('linux', env, home), [local, '/usr/local/bin/agy', own]);
+  assert.deepEqual(agyCandidates('darwin', env, home), [local, '/opt/homebrew/bin/agy', '/usr/local/bin/agy', own]);
+  assert.deepEqual(agyCandidates('win32', env, home), [path.join(env.LOCALAPPDATA, 'agy', 'bin', 'agy.exe')]);
+  assert.deepEqual(agyCandidates('win32', {}, 'C:\\Users\\x'), [path.join('C:\\Users\\x', 'AppData', 'Local', 'agy', 'bin', 'agy.exe')]);   // no LOCALAPPDATA: under the home folder
+  assert.deepEqual(agyCandidates('freebsd', env, home), agyCandidates('linux', env, home));
+  assert.equal(agyCommandName('win32'), 'agy.exe'); assert.equal(agyCommandName('linux'), 'agy'); assert.equal(agyCommandName('darwin'), 'agy');
+});
+
+test('findOnPath: the first PATH folder with agy.exe (Windows) / an executable agy (elsewhere); missing folders, folders named agy, non-executables and an empty PATH are skipped', () => {
+  const root = scratch();
+  try {
+    const a = path.join(root, 'a'), b = path.join(root, 'b'), c = path.join(root, 'c');
+    for (const d of [a, b, c]) fs.mkdirSync(d);
+    // Windows branch: ';' between folders, quotes around one tolerated, a file named plain "agy" does not count
+    touch(path.join(c, 'agy.exe'), 'MZ'); touch(path.join(a, 'agy'));
+    assert.equal(findOnPath('win32', { PATH: [a, b, c].join(';') }), path.join(c, 'agy.exe'));
+    assert.equal(findOnPath('win32', { PATH: `"${c}"` }), path.join(c, 'agy.exe'));
+    assert.equal(findOnPath('win32', { PATH: [path.join(root, 'nope'), a, b].join(';') }), null);
+    assert.equal(findOnPath('win32', { PATH: '' }), null); assert.equal(findOnPath('win32', {}), null);
+    fs.rmSync(path.join(a, 'agy'));
+    // macOS / Linux branch: ':' between folders — only off Windows, where a folder is written without a drive letter and colon
+    if (process.platform !== 'win32') {
+      exe(path.join(b, 'agy'));
+      assert.equal(findOnPath('linux', { PATH: [a, b, c].join(':') }), path.join(b, 'agy'));
+      assert.equal(findOnPath('darwin', { PATH: [path.join(root, 'nope'), b].join(':') }), path.join(b, 'agy'));
+      assert.equal(findOnPath('linux', { PATH: [a, c].join(':') }), null);   // c has only agy.exe
+      assert.equal(findOnPath('linux', { PATH: '' }), null); assert.equal(findOnPath('linux', {}), null);
+      fs.mkdirSync(path.join(a, 'agy'));                                     // a folder named agy is not it
+      touch(path.join(c, 'agy')); fs.chmodSync(path.join(c, 'agy'), 0o644);   // not executable
+      assert.equal(findOnPath('linux', { PATH: [a, c, b].join(':') }), path.join(b, 'agy'));
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('resolveAgyPath order on every platform: agyPath (~ and %VAR% expanded) → PATH → the default locations → the bare name', () => {
+  const home = scratch();
+  try {
+    const onPath = path.join(home, 'pathdir'); fs.mkdirSync(onPath);
+    const envWin = { LOCALAPPDATA: path.join(home, 'AppData', 'Local'), PATH: '' };
+    const envNix = { HOME: home, PATH: '' };
+    // nothing anywhere → the bare name; every default location is listed with its code
+    for (const [platform, env, bare, n] of [['win32', envWin, 'agy.exe', 1], ['linux', envNix, 'agy', 3], ['darwin', envNix, 'agy', 4]]) {
+      const misses = [];
+      const got = resolveAgyPath({ agyPath: '' }, misses, { platform, env, home });
+      if (platform === 'win32' || !haveSystemAgy()) { assert.equal(got, bare, platform); assert.equal(misses.length, n, platform); }
+      assert.ok(misses.some(m => m.code === 'ENOENT' && m.path.startsWith(home)), JSON.stringify(misses));
+    }
+    // a default location → that file (~/.local/bin first on macOS / Linux, %LOCALAPPDATA%\agy\bin on Windows)
+    const local = path.join(home, '.local', 'bin', 'agy'), winDefault = path.join(home, 'AppData', 'Local', 'agy', 'bin', 'agy.exe');
+    exe(local); touch(winDefault, 'MZ');
+    assert.equal(resolveAgyPath({}, [], { platform: 'linux', env: envNix, home }), local);
+    assert.equal(resolveAgyPath({}, [], { platform: 'darwin', env: envNix, home }), local);
+    assert.equal(resolveAgyPath({}, [], { platform: 'win32', env: envWin, home }), winDefault);
+    // PATH beats the default locations
+    touch(path.join(onPath, 'agy.exe'), 'MZ'); exe(path.join(onPath, 'agy'));
+    assert.equal(resolveAgyPath({}, [], { platform: 'win32', env: { ...envWin, PATH: onPath }, home }), path.join(onPath, 'agy.exe'));
+    if (process.platform !== 'win32') for (const platform of ['linux', 'darwin']) assert.equal(resolveAgyPath({}, [], { platform, env: { ...envNix, PATH: onPath }, home }), path.join(onPath, 'agy'));
+    // agyPath beats everything and is used as written, except ~ and %VAR%
+    assert.equal(resolveAgyPath({ agyPath: '/opt/x/agy' }, [], { platform: 'linux', env: { ...envNix, PATH: onPath }, home }), '/opt/x/agy');
+    assert.equal(resolveAgyPath({ agyPath: '~/tools/agy' }, [], { platform: 'linux', env: envNix, home }), `${home}/tools/agy`);
+    assert.equal(resolveAgyPath({ agyPath: '~' }, [], { platform: 'darwin', env: envNix, home }), home);
+    assert.equal(resolveAgyPath({ agyPath: 'not~/x' }, [], { platform: 'linux', env: envNix, home }), 'not~/x');   // only a leading ~
+    assert.equal(resolveAgyPath({ agyPath: String.raw`%LOCALAPPDATA%\agy\bin\agy.exe` }, [], { platform: 'win32', env: envWin, home }), String.raw`${envWin.LOCALAPPDATA}\agy\bin\agy.exe`);
+    assert.equal(expandPath('%NOPE%/agy', {}, home), '%NOPE%/agy');
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('msixHint: Windows only — the same ENOENT under AppData\\Local, drawer found or not, says nothing on macOS / Linux', () => {
+  const local = [{ path: String.raw`C:\Users\Someone\AppData\Local\agy\bin\agy.exe`, code: 'ENOENT' }];
+  const found = { package: 'Claude_abc', path: String.raw`C:\Users\Someone\AppData\Local\Packages\Claude_abc\LocalCache\Local\agy\bin\agy.exe` };
+  assert.equal(msixHint(local, null, { platform: 'win32' }), MSIX_HINT);
+  for (const platform of ['linux', 'darwin', 'freebsd']) {
+    assert.equal(msixHint(local, null, { platform }), null);
+    assert.equal(msixHint(local, found, { platform }), null);
+    assert.equal(msixHint(local, found, { platform, short: true }), null);
+  }
+});
+
+test('agyPathAdvice / humanError "agy not found": Windows names %LOCALAPPDATA%\\agy\\bin\\agy.exe; macOS / Linux say "which agy" and name ~/.local/bin (macOS adds Homebrew); no MSIX sentence off Windows', () => {
+  assert.match(agyPathAdvice('win32'), /%LOCALAPPDATA%\\agy\\bin\\agy\.exe/);
+  assert.match(agyPathAdvice('linux'), /which agy/); assert.match(agyPathAdvice('linux'), /~\/\.local\/bin\/agy/); assert.doesNotMatch(agyPathAdvice('linux'), /agy\.exe|homebrew/i);
+  assert.match(agyPathAdvice('darwin'), /which agy/); assert.match(agyPathAdvice('darwin'), /\/opt\/homebrew\/bin\/agy/); assert.doesNotMatch(agyPathAdvice('darwin'), /agy\.exe/);
+  assert.equal(agyPathAdvice(), agyPathAdvice(process.platform));
+  const e = p => Object.assign(new Error(`spawn ${p} ENOENT`), { code: 'ENOENT', syscall: `spawn ${p}`, path: p });
+  const win = humanError(e(String.raw`C:\Users\Someone\AppData\Local\agy\bin\agy.exe`), { platform: 'win32' });
+  assert.match(win, /agy\.exe 的完整路徑/); assert.ok(win.includes(MSIX_HINT_SHORT), win);
+  for (const platform of ['linux', 'darwin']) {
+    const t = humanError(e('/home/someone/AppData/Local/agy/bin/agy.exe'), { platform });   // even a Windows-looking path says nothing about MSIX off Windows
+    assert.match(t, /找不到 agy 程式/); assert.match(t, /which agy/); assert.doesNotMatch(t, /Claude 桌面版|agy\.exe 的完整路徑/);
+    assert.ok(t.indexOf('agyPath') < t.indexOf('才照 README'), t);
+  }
 });

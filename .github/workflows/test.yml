@@ -1,0 +1,26 @@
+# The test suite on the three platforms players use. No network, no real agy: the suite runs against
+# test/fixtures/fake-agy.mjs, and the Windows-only branches (MSIX drawer, agy.exe) are run as Windows on
+# every OS by injecting the platform.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --version
+      - run: npm test

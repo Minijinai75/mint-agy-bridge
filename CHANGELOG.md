@@ -1,5 +1,16 @@
 # 更新紀錄
 
+## 0.1.4（2026-10-22）
+
+一件事：橋在 Linux 與 macOS 真的能用了。作者在 Windows 上開發、測試，這版第一次在 Linux 跑整套測試、在三個平台跑 CI。升級照 README 的「升級三步」：`git pull`、看這段、重啟酒館。沒有要改的設定，`config.json` 的鍵名、預設埠、API 行為都沒動。
+
+- **Linux 上原本紅的格**：整套測試在 Linux 跑，1 格紅、2 格被跳過。紅的那格是狀態頁把使用者資料夾遮成 `~` 的測試——它把假路徑放在系統暫存夾底下，Windows 的暫存夾在 `AppData\Local\Temp`、在家目錄裡，macOS／Linux 的 `/tmp`、`/var/folders` 不在，遮不到；而且那格把路徑轉成大寫，在大小寫有別的檔案系統上是另一個路徑。追下去發現遮罩本身在 macOS／Linux 也有錯：`/home/name/x` 會遮成 `/~/x`（開頭的斜線沒算進去），`/root` 這種短家目錄還會把句子裡的 `root` 字樣一起遮掉；現在開頭的斜線算進去、資料夾名字要整個對上才遮。被跳過的兩格是 Windows 限定的 MSIX 抽屜測試，現在改成把平台注進去，三個平台都跑得到 Windows 那條路。
+- **找 agy 的順序分平台**：`agyPath` → PATH（酒館那個程序看到的 PATH 裡第一個有 agy 的資料夾，狀態頁的 `agy.path` 直接顯示完整路徑）→ 各平台安裝程式的預設位置（Windows `%LOCALAPPDATA%\agy\bin\agy.exe`；Linux `~/.local/bin/agy`、`/usr/local/bin/agy`、`~/.antigravity/bin/agy`；macOS 多 Homebrew 的 `/opt/homebrew/bin/agy`、`/usr/local/bin/agy`）→ 裸名 `agy`／`agy.exe`。`agyPath` 開頭的 `~` 會展開成家目錄。MSIX 抽屜那段（0.1.3）只在 Windows 跑，macOS／Linux 直接跳過、不提示；狀態頁與紅色通知的「填 agyPath」那句分平台：Windows 寫 `%LOCALAPPDATA%\agy\bin\agy.exe`，macOS／Linux 寫 `which agy` 與 `~/.local/bin/agy`（macOS 加 Homebrew 的位置）。主控台「預設位置讀不到」那行在 macOS／Linux 印 `HOME` 而不是 `LOCALAPPDATA`。
+- **停掉 agy 時連子程序一起停**（macOS／Linux）：Windows 本來就用 `taskkill /T` 整棵砍；macOS／Linux 以前只送 SIGTERM 給 agy 本身，它開的子程序會留下來。現在 agy 跑在自己的 process group 裡，整組一起停。新增測試：卡住被停的那發，它開的子程序也要消失（三個平台都跑）。
+- **GitHub Actions**：`.github/workflows/test.yml` 在 ubuntu、windows、macos 各跑一次 `npm test`（Node 22）。
+- **README 英文版**：`README.en.md`，內容對齊中文版；中文版頂端連過去。中文版補 macOS／Linux 的安裝備註（`~/.local/bin` 不在 PATH 時怎麼辦、從桌面啟動的酒館 PATH 不同）、`agyPath` 的寫法、「橋怎麼找 agy」一段、錯誤表那格。
+- 真裝 agy：這版的開發環境連不到 `antigravity.google`（網路政策擋掉），裝不起來；npm 上名叫 `antigravity-cli` 的是佔位套件，不是官方的。找 agy 的邏輯用測試自帶的假執行檔驗（macOS／Linux 用一支包著假 agy 的 shell 腳本放進 PATH，狀態頁要顯示它的路徑、版本 1.4.2、聊天要走得通；Windows 用一個名叫 `agy.exe` 的假檔驗 PATH 掃描與預設位置）。驗過的 agy 版本清單沒動。
+
 ## 0.1.3（2026-10-22）
 
 一件事：叫 Claude 桌面版幫你裝的 agy，酒館看不到。升級照 README 的「升級三步」：`git pull`、看這段、重啟酒館。沒有要改的設定。
