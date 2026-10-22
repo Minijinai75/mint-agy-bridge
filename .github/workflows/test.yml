@@ -3,6 +3,9 @@
 # every OS by injecting the platform.
 name: test
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]

@@ -5,9 +5,10 @@ import { parseMessages, IMAGE_PLACEHOLDER } from '../lib/parse.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { planTurn, renderAgentFile, agentNameFor, LONG_MESSAGE_POINTER, CONTINUE_POINTER, CONTINUE_INSTRUCTION, BODY_MARKER, stdinLine } from '../lib/agent-file.mjs';
 import { humanError, parseAgyError, msixHint, MSIX_HINT, MSIX_HINT_SHORT, agyPathAdvice } from '../lib/errors.mjs';
-import { parseModelList, estimateTokens, CONTENT_FILTER_RE, withoutThinking, visibleCounter, tokenWeight, resolveAgyPath, agyMissLine, findVirtualizedAgy, leadingThinkStripper, redactAgyLog, maskHome, agyCandidates, agyCommandName, findOnPath, expandPath } from '../lib/agy.mjs';
+import { parseModelList, estimateTokens, CONTENT_FILTER_RE, withoutThinking, visibleCounter, tokenWeight, resolveAgyPath, agyMissLine, findVirtualizedAgy, leadingThinkStripper, redactAgyLog, maskHome, agyCandidates, agyCommandName, findOnPath, expandPath, forgetAgyPath, agyVersion } from '../lib/agy.mjs';
 import { loadConfig, applyRuntimePatch, publicConfig, DEFAULTS } from '../lib/config.mjs';
 
 const sys = c => ({ role: 'system', content: c });
@@ -477,6 +478,8 @@ test('findOnPath: the first PATH folder with agy.exe (Windows) / an executable a
     touch(path.join(c, 'agy.exe'), 'MZ'); touch(path.join(a, 'agy'));
     assert.equal(findOnPath('win32', { PATH: [a, b, c].join(';') }), path.join(c, 'agy.exe'));
     assert.equal(findOnPath('win32', { PATH: `"${c}"` }), path.join(c, 'agy.exe'));
+    const rel = path.relative(process.cwd(), c);   // a relative PATH entry (".", "bin") → the answer is absolute, read against cwd now (on Windows across drives this stays absolute: nothing to test then)
+    if (!path.isAbsolute(rel)) { const got = findOnPath('win32', { PATH: rel }); assert.ok(path.isAbsolute(got), got); assert.equal(path.resolve(got), path.resolve(c, 'agy.exe')); }
     assert.equal(findOnPath('win32', { PATH: [path.join(root, 'nope'), a, b].join(';') }), null);
     assert.equal(findOnPath('win32', { PATH: '' }), null); assert.equal(findOnPath('win32', {}), null);
     fs.rmSync(path.join(a, 'agy'));
@@ -494,8 +497,9 @@ test('findOnPath: the first PATH folder with agy.exe (Windows) / an executable a
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('resolveAgyPath order on every platform: agyPath (~ and %VAR% expanded) → PATH → the default locations → the bare name', () => {
+test('resolveAgyPath order on every platform: agyPath (~ and %VAR% expanded) → PATH → the default locations → the bare name (each call fresh: the files change between calls)', () => {
   const home = scratch();
+  forgetAgyPath();
   try {
     const onPath = path.join(home, 'pathdir'); fs.mkdirSync(onPath);
     const envWin = { LOCALAPPDATA: path.join(home, 'AppData', 'Local'), PATH: '' };
@@ -503,26 +507,26 @@ test('resolveAgyPath order on every platform: agyPath (~ and %VAR% expanded) →
     // nothing anywhere → the bare name; every default location is listed with its code
     for (const [platform, env, bare, n] of [['win32', envWin, 'agy.exe', 1], ['linux', envNix, 'agy', 3], ['darwin', envNix, 'agy', 4]]) {
       const misses = [];
-      const got = resolveAgyPath({ agyPath: '' }, misses, { platform, env, home });
+      const got = resolveAgyPath({ agyPath: '' }, misses, { fresh: true, platform, env, home });
       if (platform === 'win32' || !haveSystemAgy()) { assert.equal(got, bare, platform); assert.equal(misses.length, n, platform); }
       assert.ok(misses.some(m => m.code === 'ENOENT' && m.path.startsWith(home)), JSON.stringify(misses));
     }
     // a default location → that file (~/.local/bin first on macOS / Linux, %LOCALAPPDATA%\agy\bin on Windows)
     const local = path.join(home, '.local', 'bin', 'agy'), winDefault = path.join(home, 'AppData', 'Local', 'agy', 'bin', 'agy.exe');
     exe(local); touch(winDefault, 'MZ');
-    assert.equal(resolveAgyPath({}, [], { platform: 'linux', env: envNix, home }), local);
-    assert.equal(resolveAgyPath({}, [], { platform: 'darwin', env: envNix, home }), local);
-    assert.equal(resolveAgyPath({}, [], { platform: 'win32', env: envWin, home }), winDefault);
+    assert.equal(resolveAgyPath({}, [], { fresh: true, platform: 'linux', env: envNix, home }), local);
+    assert.equal(resolveAgyPath({}, [], { fresh: true, platform: 'darwin', env: envNix, home }), local);
+    assert.equal(resolveAgyPath({}, [], { fresh: true, platform: 'win32', env: envWin, home }), winDefault);
     // PATH beats the default locations
     touch(path.join(onPath, 'agy.exe'), 'MZ'); exe(path.join(onPath, 'agy'));
-    assert.equal(resolveAgyPath({}, [], { platform: 'win32', env: { ...envWin, PATH: onPath }, home }), path.join(onPath, 'agy.exe'));
-    if (process.platform !== 'win32') for (const platform of ['linux', 'darwin']) assert.equal(resolveAgyPath({}, [], { platform, env: { ...envNix, PATH: onPath }, home }), path.join(onPath, 'agy'));
+    assert.equal(resolveAgyPath({}, [], { fresh: true, platform: 'win32', env: { ...envWin, PATH: onPath }, home }), path.join(onPath, 'agy.exe'));
+    if (process.platform !== 'win32') for (const platform of ['linux', 'darwin']) assert.equal(resolveAgyPath({}, [], { fresh: true, platform, env: { ...envNix, PATH: onPath }, home }), path.join(onPath, 'agy'));
     // agyPath beats everything and is used as written, except ~ and %VAR%
-    assert.equal(resolveAgyPath({ agyPath: '/opt/x/agy' }, [], { platform: 'linux', env: { ...envNix, PATH: onPath }, home }), '/opt/x/agy');
-    assert.equal(resolveAgyPath({ agyPath: '~/tools/agy' }, [], { platform: 'linux', env: envNix, home }), `${home}/tools/agy`);
-    assert.equal(resolveAgyPath({ agyPath: '~' }, [], { platform: 'darwin', env: envNix, home }), home);
-    assert.equal(resolveAgyPath({ agyPath: 'not~/x' }, [], { platform: 'linux', env: envNix, home }), 'not~/x');   // only a leading ~
-    assert.equal(resolveAgyPath({ agyPath: String.raw`%LOCALAPPDATA%\agy\bin\agy.exe` }, [], { platform: 'win32', env: envWin, home }), String.raw`${envWin.LOCALAPPDATA}\agy\bin\agy.exe`);
+    assert.equal(resolveAgyPath({ agyPath: '/opt/x/agy' }, [], { fresh: true, platform: 'linux', env: { ...envNix, PATH: onPath }, home }), '/opt/x/agy');
+    assert.equal(resolveAgyPath({ agyPath: '~/tools/agy' }, [], { fresh: true, platform: 'linux', env: envNix, home }), `${home}/tools/agy`);
+    assert.equal(resolveAgyPath({ agyPath: '~' }, [], { fresh: true, platform: 'darwin', env: envNix, home }), home);
+    assert.equal(resolveAgyPath({ agyPath: 'not~/x' }, [], { fresh: true, platform: 'linux', env: envNix, home }), 'not~/x');   // only a leading ~
+    assert.equal(resolveAgyPath({ agyPath: String.raw`%LOCALAPPDATA%\agy\bin\agy.exe` }, [], { fresh: true, platform: 'win32', env: envWin, home }), String.raw`${envWin.LOCALAPPDATA}\agy\bin\agy.exe`);
     assert.equal(expandPath('%NOPE%/agy', {}, home), '%NOPE%/agy');
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
@@ -551,4 +555,126 @@ test('agyPathAdvice / humanError "agy not found": Windows names %LOCALAPPDATA%\\
     assert.match(t, /找不到 agy 程式/); assert.match(t, /which agy/); assert.doesNotMatch(t, /Claude 桌面版|agy\.exe 的完整路徑/);
     assert.ok(t.indexOf('agyPath') < t.indexOf('才照 README'), t);
   }
+});
+
+// ── 0.1.4 maintainer review: the lookup is remembered per process ─────────
+// A PATH entry on an unreachable network place makes every stat wait for the SMB timeout (21 s measured),
+// synchronously, holding the whole SillyTavern process; so PATH is scanned once, not once per call.
+// The slow folder here only counts its stats: what is tested is how often it is asked.
+test('resolveAgyPath remembers its answer: three calls stat the PATH folders once; forgetAgyPath (a spawn ENOENT) and fresh:true look again; other inputs are another answer', () => {
+  const root = scratch();
+  const realStat = fs.statSync;
+  const stats = [];   // every stat of a path under root, in order
+  fs.statSync = function (p, ...rest) { if (String(p).startsWith(root)) stats.push(String(p)); return realStat.call(fs, p, ...rest); };
+  try {
+    const slow = path.join(root, 'dead-share'), bin = path.join(root, 'bin');
+    fs.mkdirSync(slow); fs.mkdirSync(bin);
+    touch(path.join(bin, 'agy.exe'), 'MZ');
+    // The Windows branch, run on any OS: a plain stat per folder, no execute bit involved.
+    const env = { PATH: [slow, bin].join(';'), LOCALAPPDATA: path.join(root, 'AppData', 'Local') };
+    const opts = { platform: 'win32', env, home: root }, cfg = { agyPath: '' };
+    forgetAgyPath();
+    assert.equal(resolveAgyPath(cfg, [], opts), path.join(bin, 'agy.exe'));
+    const oneRound = stats.length;
+    assert.deepEqual(stats, [path.join(slow, 'agy.exe'), path.join(bin, 'agy.exe')]);   // the dead share was asked once…
+    assert.equal(resolveAgyPath(cfg, [], opts), path.join(bin, 'agy.exe'));
+    assert.equal(resolveAgyPath(cfg, [], opts), path.join(bin, 'agy.exe'));
+    assert.equal(stats.length, oneRound, '…and not again on the next two calls');
+    // The remembered answer outlives the file: until something drops it, no stat at all.
+    fs.rmSync(path.join(bin, 'agy.exe'));
+    assert.equal(resolveAgyPath(cfg, [], opts), path.join(bin, 'agy.exe'));
+    assert.equal(stats.length, oneRound);
+    // forgetAgyPath — what every spawn that comes back ENOENT calls — makes the next call look again: now the default location is tried too, with its code
+    forgetAgyPath();
+    const misses = [];
+    assert.equal(resolveAgyPath(cfg, misses, opts), 'agy.exe');
+    assert.equal(stats.length, oneRound + 3, JSON.stringify(stats.slice(oneRound)));   // two PATH folders + the default location
+    assert.deepEqual(misses.map(m => m.code), ['ENOENT']);
+    const misses2 = [];
+    assert.equal(resolveAgyPath(cfg, misses2, opts), 'agy.exe');
+    assert.equal(stats.length, oneRound + 3); assert.deepEqual(misses2, misses);   // the misses come from memory too (the console line and the MSIX verdict read them)
+    // fresh: true (what checkAgy passes on every re-check) looks again as well — the 26-10-20 case: there now
+    touch(path.join(bin, 'agy.exe'), 'MZ');
+    assert.equal(resolveAgyPath(cfg, [], opts), 'agy.exe');                      // remembered
+    assert.equal(resolveAgyPath(cfg, [], { ...opts, fresh: true }), path.join(bin, 'agy.exe'));
+    assert.equal(stats.length, oneRound + 3 + 2);
+    assert.equal(resolveAgyPath(cfg, [], opts), path.join(bin, 'agy.exe'));     // and the fresh answer is what is remembered now
+    assert.equal(stats.length, oneRound + 5);
+    // Different inputs are not the remembered answer: another PATH, another platform, an agyPath (used as written, nothing to remember)
+    assert.equal(resolveAgyPath(cfg, [], { ...opts, env: { ...env, PATH: bin } }), path.join(bin, 'agy.exe'));
+    assert.equal(stats.length, oneRound + 6);
+    assert.equal(resolveAgyPath({ agyPath: path.join(root, 'x', 'agy.exe') }, [], opts), path.join(root, 'x', 'agy.exe'));
+    assert.equal(stats.length, oneRound + 6);
+  } finally { fs.statSync = realStat; forgetAgyPath(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// The invalidation end to end: agy was found through PATH and remembered; then it moves. The next spawn
+// comes back ENOENT once, which drops the remembered path, and the call after that finds it where it is now.
+// (The fake agy is run through a shell wrapper on PATH, which Windows cannot do without a shell.)
+test('a spawn that comes back ENOENT drops the remembered path: the next call looks again and finds agy where it is now (macOS / Linux)', { skip: process.platform === 'win32' }, async () => {
+  const root = scratch();
+  const d1 = path.join(root, 'd1'), d2 = path.join(root, 'd2');
+  fs.mkdirSync(d1); fs.mkdirSync(d2);
+  const fake = fileURLToPath(new URL('./fixtures/fake-agy.mjs', import.meta.url));   // not URL.pathname: a space or a non-ASCII character in the checkout path would stay percent-encoded
+  const wrapper = dir => { const w = path.join(dir, 'agy'); fs.writeFileSync(w, `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`); fs.chmodSync(w, 0o755); return w; };
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${d1}:${d2}:${savedPath}`;
+  const cfg = { agyPath: '', maxRetries: 0 };
+  try {
+    forgetAgyPath();
+    const w1 = wrapper(d1);
+    assert.equal(await agyVersion(cfg), '1.4.2');
+    assert.equal(resolveAgyPath(cfg), w1);
+    fs.rmSync(w1); const w2 = wrapper(d2);           // agy moved
+    assert.equal(resolveAgyPath(cfg), w1);           // still the remembered answer: nothing has failed yet
+    const diag = {};
+    assert.equal(await agyVersion(cfg, diag), null);  // the spawn fails once…
+    assert.equal(diag.code, 'ENOENT');
+    assert.equal(resolveAgyPath(cfg), w2);           // …which dropped the remembered path: looked up again
+    assert.equal(await agyVersion(cfg), '1.4.2');
+  } finally { process.env.PATH = savedPath; forgetAgyPath(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// The same invalidation without a shell wrapper, so the Windows leg of CI runs it too: the remembered file is
+// deleted, `agy --version` on it comes back ENOENT (the execFile callback forgets), the file is put back, and
+// the next lookup stats again and finds it. The real platform's branch and file name are used.
+test('ENOENT from agy --version drops the remembered path on every OS: the next lookup looks again and finds the file put back', async () => {
+  const root = scratch(), bin = path.join(root, 'bin');
+  fs.mkdirSync(bin);
+  const file = path.join(bin, agyCommandName(process.platform));
+  const put = () => { touch(file, process.platform === 'win32' ? 'MZ' : '#!/bin/sh\necho 1.4.2\n'); if (process.platform !== 'win32') fs.chmodSync(file, 0o755); };
+  put();
+  const savedPath = process.env.PATH;
+  process.env.PATH = bin;   // the one PATH folder, for the lookup and for the OS at spawn time alike
+  const cfg = { agyPath: '', maxRetries: 0 };
+  const realStat = fs.statSync;
+  let stats = 0;
+  fs.statSync = function (p, ...rest) { if (String(p).startsWith(root)) stats++; return realStat.call(fs, p, ...rest); };
+  try {
+    forgetAgyPath();
+    assert.equal(resolveAgyPath(cfg), file);
+    const once = stats; assert.ok(once >= 1);
+    assert.equal(resolveAgyPath(cfg), file); assert.equal(stats, once);   // remembered: no stat
+    fs.rmSync(file);
+    const diag = {};
+    assert.equal(await agyVersion(cfg, diag), null); assert.equal(diag.code, 'ENOENT');   // the spawn of the remembered file fails…
+    put();
+    assert.equal(resolveAgyPath(cfg), file); assert.ok(stats > once, `stats ${stats}`);  // …so the next lookup stats again and finds it where it was put back
+    assert.equal(resolveAgyPath(cfg), file); assert.equal(stats, once * 2);             // and remembers that
+  } finally { fs.statSync = realStat; process.env.PATH = savedPath; forgetAgyPath(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// A default location that is there but not executable is skipped like a PATH folder's would be (else it is
+// remembered, every spawn fails EACCES — not ENOENT, so nothing forgets it — and an agy installed on PATH later is never used).
+test('resolveAgyPath (macOS / Linux): a default-location agy without the execute bit is skipped with EACCES, the bare name follows', { skip: process.platform === 'win32' }, () => {
+  const home = scratch();
+  try {
+    const local = path.join(home, '.local', 'bin', 'agy');
+    touch(local, '#!/bin/sh\n'); fs.chmodSync(local, 0o644);
+    const misses = [];
+    assert.equal(resolveAgyPath({ agyPath: '' }, misses, { platform: 'linux', env: { HOME: home, PATH: '' }, home, fresh: true }), 'agy');
+    assert.deepEqual(misses.find(m => m.path === local), { path: local, code: 'EACCES' });
+    fs.chmodSync(local, 0o755);
+    assert.equal(resolveAgyPath({ agyPath: '' }, [], { platform: 'linux', env: { HOME: home, PATH: '' }, home, fresh: true }), local);
+  } finally { forgetAgyPath(); fs.rmSync(home, { recursive: true, force: true }); }
 });

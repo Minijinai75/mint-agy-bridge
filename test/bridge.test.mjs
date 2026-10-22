@@ -660,6 +660,20 @@ test('no agyPath: an executable agy on PATH is found and run; /status shows its 
     assert.deepEqual(st.warnings.filter(w => /agyPath|桌面版/.test(w)), []);
     const j = await (await chat({ model: M, messages: msgs('經由 PATH') })).json();
     assert.match(j.choices[0].message.content, /^echo:經由 PATH/);
+    // The found path is remembered per process (maintainer review: a dead network share on PATH costs 21 s per stat).
+    // agy moves to a later PATH folder: the next turn's spawn is ENOENT once, which drops the remembered path; the turn after finds it again.
+    const binDir2 = path.join(tmp, 'path-bin-2'); fs.mkdirSync(binDir2, { recursive: true });
+    process.env.PATH = `${binDir}:${binDir2}:${savedPath}`;
+    _forgetAgy(); await fetch(`${base}/status`);   // the re-check remembers binDir's wrapper with this PATH
+    const wrapper2 = path.join(binDir2, 'agy');
+    fs.writeFileSync(wrapper2, fs.readFileSync(wrapper)); fs.chmodSync(wrapper2, 0o755); fs.rmSync(wrapper);
+    const failed = await (await chat({ model: M, messages: msgs('搬家後第一發') })).json();
+    assert.match(failed.error.message, /找不到 agy 程式/); assert.match(failed.error.message, /ENOENT/);
+    const ok = await (await chat({ model: M, messages: msgs('搬家後第二發') })).json();
+    assert.match(ok.choices[0].message.content, /^echo:搬家後第二發/);
+    _forgetAgy();
+    const st2 = await (await fetch(`${base}/status`)).json();
+    assert.equal(st2.agy.path, maskHome(wrapper2)); assert.equal(st2.agy.version, '1.4.2');
   } finally {
     process.env.PATH = savedPath;
     _setConfig({ agyPath: BASE_CFG.agyPath, statusRecheckMs: 0 });

@@ -6,6 +6,8 @@ Chat in SillyTavern with your own **Antigravity** account. Mint AGY Bridge is a 
 
 In short: an OpenAI-compatible `/v1/chat/completions` (streaming and non-streaming) backed by the official Antigravity CLI. Zero dependencies, Node 18+, Windows / macOS / Linux. The models are whatever `agy models` lists for your account.
 
+One thing to know before you start: the bridge's own messages — the red notice in SillyTavern, the console lines and the `warnings` on the status page — are in Chinese, and there is no language switch. Match them by the original line, the number in it, or the raw error after `（原始錯誤：…）` ("original error:"). A red notice about a message that failed while generating starts with `薄荷橋：` (the bridge's name); console lines start with `[mint-agy-bridge]`; the status page's `warnings` carry no prefix. The [Common errors](#common-errors) table below lists each Chinese line next to its English meaning.
+
 ## Who it is for
 
 - SillyTavern players who have an Antigravity account and can already run `agy` in a terminal.
@@ -24,7 +26,7 @@ irm https://antigravity.google/cli/install.ps1 | iex
 curl -fsSL https://antigravity.google/cli/install.sh | bash
 ```
 
-Run this in **a terminal you opened yourself** (Windows: Start menu → PowerShell or Windows Terminal). On Windows, if you let an AI inside an app such as the Claude desktop app run it for you, agy ends up in that app's private drawer and SillyTavern cannot see it — why, how to tell, and how to fix it are under [File-system virtualization in MSIX-packaged apps](#file-system-virtualization-in-msix-packaged-apps-letting-the-claude-desktop-app-install-agy-bites) below (Windows only).
+Run this in **a terminal you opened yourself** (Windows: Start menu → PowerShell or Windows Terminal). On Windows, if you let an AI inside an app such as the Claude desktop app run it for you, agy ends up in that app's private drawer and SillyTavern cannot see it — why, how to tell, and how to fix it are under [File-system virtualization in MSIX-packaged apps (MSIX 封裝 App 的檔案虛擬化)](#file-system-virtualization-in-msix-packaged-apps-msix-封裝-app-的檔案虛擬化-letting-the-claude-desktop-app-install-agy-bites) below (Windows only).
 
 macOS / Linux: the install script puts `agy` in `~/.local/bin/agy` (as the install guides on the web describe it; the official page is <https://antigravity.google/docs/install/>). Afterwards **open a new terminal** and run `agy --version`. If the shell says the command is not found, `~/.local/bin` is not on your PATH: add `export PATH="$HOME/.local/bin:$PATH"` to `~/.bashrc` or `~/.zshrc`. When SillyTavern is started from a desktop shortcut, launchd or systemd, it often sees a different PATH than your terminal does; if the bridge cannot find agy, the surest fix is to put the full path into `agyPath` in `config.json` (see below).
 
@@ -121,32 +123,36 @@ On Windows the bridge additionally looks into the drawers of MSIX-packaged apps 
 
 When a message fails, SillyTavern shows a red notice; the error is never written into the character's reply (streaming or not). If nothing had been produced yet, the message is not saved as a reply; if it failed half-way, the text already produced stays and the notice is shown separately. The original error is in brackets inside the notice.
 
+The bridge's own messages (the red notice, the console, the status page's warnings) are in Chinese; match by the original line, the number, or the raw error after `（原始錯誤：…）`. The left column below gives the Chinese line as the bridge prints it, with its English meaning.
+
 **When you report a problem, include the status page**: open `http://127.0.0.1:5499/status` in a browser and paste the whole page. It holds the version, the model of the last message, how long it took, how many tokens it produced, the tokens per second (`tokPerSec`), and whether it timed out, stalled or was filtered — no chat content. "Same here" alone does not tell us which case it was. Do not restart SillyTavern right away after a failure: copy the status page first, a restart clears the "last message". For runs that stalled, timed out or where agy did not exit, the bridge keeps agy's own log in the plugin folder's `logs/` (the last 5 only; e-mail, Google Cloud project id, tokens and your own agy permission rules are masked, your user folder is written as `~`; the log holds no character card and no chat content); `agyLog` on the status page names the file, and we may ask you for its last few dozen lines.
 
 | You see | Cause and what to do |
 |---|---|
-| agy not found / the status page says agy cannot be found | Fastest fix: fill in `agyPath` in `config.json` (Windows: the full path of agy.exe; macOS / Linux: what `which agy` prints in a terminal, usually `~/.local/bin/agy`) and restart SillyTavern. On macOS / Linux the usual cause is a SillyTavern started from the desktop or a service, whose PATH lacks `~/.local/bin`; `agyPath` goes around that. agy is installed but is not found right as SillyTavern starts (two players hit this): since 0.1.2 the bridge looks again after 5 s, up to three times, and opening the status page looks once more; the console prints the error code of that moment (`ENOENT`, `EBUSY`, `EPERM`…), include it when you report. **Windows, agy was installed for you by the Claude desktop app, and even a full `agyPath` gives `ENOENT`**: see "File-system virtualization in MSIX-packaged apps" below; since 0.1.3 the status page adds a hint. Only when agy is really not installed go back to step 1 |
-| no words from the model for N seconds | The reply stopped moving (half-way, or before the first word); not a timeout, not a broken bridge. If the notice says it was "already sent again once", the retry stalled too; wait a minute or two and press Regenerate, and switch models if it keeps happening |
-| the model is not in your agy account's list | Your sign-in does not see this model. Refresh SillyTavern's model list and pick again |
-| the Google Cloud project's quota is too low (429) | In the Google Cloud console's "Quotas" page request a higher quota for that model, or switch models |
-| quota or rate limit reached (429) | Wait a minute or two and press Regenerate, or switch models |
-| not enough AI credits | Check your usage in Antigravity |
-| not signed in / sign-in expired | Type `agy` in a terminal and sign in again; with ADC run `gcloud auth application-default login` |
-| cannot reach Google (network or proxy) | The network is down or your proxy software is not running |
-| blocked by Google's content filter | Google judged this output against its usage policy (the original error says `content safety filters`). agy retries a blocked reply three times, waiting in vain each time, so the bridge stops it as soon as it sees the message instead of dragging on to the timeout. **The most often blocked one is Horae's plot summary** (it asks the model to retell the whole plot). Rephrase the latest line, swipe with other wording, or switch models |
-| this message was refused for its content | The provider's other content moderation. Rephrase and send again, or switch models |
-| no permission for this model (403) | The Google Cloud project has Vertex AI (`aiplatform.googleapis.com`) disabled or the model is not enabled |
-| the bridge stopped agy after N seconds | Time ran out before the reply was finished; the bridge stopped it, agy is not broken. Press Regenerate; if it happens often raise `printTimeoutSec` (a slow model, a long history and a long reply together hit it most easily) |
-| agy ended on its own (code N) | agy quit without saying why: usually quota, a content block or trouble on the model's side. Wait a minute or two and press Regenerate, switch models if it keeps happening; include the status page when you report |
-| replaced by a newer request in the same chat (409) | You sent another line or pressed Regenerate before it finished; normal |
-| N messages already generating (429) | Other chats are still generating; wait for them, or raise `maxConcurrent` |
-| wrong API key (401) | SillyTavern's API Key field must equal `apiKey` in `config.json` |
-| agy cannot find the agent file the bridge wrote | A new agy version changed behaviour; please open an issue on GitHub |
-| port 5499 is in use | Another bridge may already be running (one inside SillyTavern plus a standalone, say). For two of them, change `port` in `config.json` and the URL in SillyTavern |
+| `找不到 agy 程式` ("agy not found") / status page: `找不到 agy 或讀不到版本` ("agy not found, or its version cannot be read") | Fastest fix: fill in `agyPath` in `config.json` (Windows: the full path of agy.exe; macOS / Linux: what `which agy` prints in a terminal, usually `~/.local/bin/agy`) and restart SillyTavern. On macOS / Linux the usual cause is a SillyTavern started from the desktop or a service, whose PATH lacks `~/.local/bin`; `agyPath` goes around that. agy is installed but is not found right as SillyTavern starts (two players hit this): since 0.1.2 the bridge looks again after 5 s, up to three times, and opening the status page looks once more; the console prints the error code of that moment (`ENOENT`, `EBUSY`, `EPERM`…), include it when you report. **Windows, agy was installed for you by the Claude desktop app, and even a full `agyPath` gives `ENOENT`**: see "File-system virtualization in MSIX-packaged apps" (MSIX 封裝 App 的檔案虛擬化) below; since 0.1.3 the status page adds a hint. Only when agy is really not installed go back to step 1 |
+| `模型那頭 N 秒沒出字` ("no words from the model for N seconds") | The reply stopped moving (half-way, or before the first word); not a timeout, not a broken bridge. If the notice says it was "already sent again once", the retry stalled too; wait a minute or two and press Regenerate, and switch models if it keeps happening |
+| `這個模型不在你 agy 帳號的清單裡` / `模型「…」不在你 agy 帳號的清單裡` ("the model is not in your agy account's list") | Your sign-in does not see this model. Refresh SillyTavern's model list and pick again |
+| `你的 Google Cloud 專案對這顆模型的配額不夠（429）` ("your Google Cloud project's quota for this model is too low (429)") | In the Google Cloud console's "Quotas" page request a higher quota for that model, or switch models |
+| `額度或速率到上限（429）` ("quota or rate limit reached (429)") | Wait a minute or two and press Regenerate, or switch models |
+| `反重力的 AI 點數不足` ("not enough Antigravity AI credits") | Check your usage in Antigravity |
+| `agy 還沒登入或登入失效` ("agy not signed in, or the sign-in expired") / `Google Cloud 的登入過期或找不到了` ("the Google Cloud sign-in expired or cannot be found") | Type `agy` in a terminal and sign in again; with ADC run `gcloud auth application-default login` |
+| `連不上 Google（網路或代理有問題）` ("cannot reach Google (network or proxy)") | The network is down or your proxy software is not running |
+| `被 Google 的內容過濾擋下了` ("blocked by Google's content filter") | Google judged this output against its usage policy (the original error says `content safety filters`). agy retries a blocked reply three times, waiting in vain each time, so the bridge stops it as soon as it sees the message instead of dragging on to the timeout. **The most often blocked one is Horae's plot summary** (it asks the model to retell the whole plot). Rephrase the latest line, swipe with other wording, or switch models |
+| `模型供應商依內容擋下了這一發` ("the model provider refused this one for its content") | The provider's other content moderation. Rephrase and send again, or switch models |
+| `沒有權限用這顆模型（403）` ("no permission for this model (403)") | The Google Cloud project has Vertex AI (`aiplatform.googleapis.com`) disabled or the model is not enabled |
+| `橋在 N 秒時停掉了 agy` ("the bridge stopped agy at N seconds") | Time ran out before the reply was finished; the bridge stopped it, agy is not broken. Press Regenerate; if it happens often raise `printTimeoutSec` (a slow model, a long history and a long reply together hit it most easily) |
+| `agy 自己中途結束了（代碼 N）` ("agy ended on its own (code N)") | agy quit without saying why: usually quota, a content block or trouble on the model's side. Wait a minute or two and press Regenerate, switch models if it keeps happening; include the status page when you report |
+| `這一則被同一段對話的新請求取代了` ("replaced by a newer request in the same chat", HTTP 409) | You sent another line or pressed Regenerate before it finished; normal |
+| `同時在生的已經有 N 則` ("N messages already generating", HTTP 429) | Other chats are still generating; wait for them, or raise `maxConcurrent` |
+| `API key 不對（config.json 的 apiKey）` ("wrong API key", HTTP 401) | SillyTavern's API Key field must equal `apiKey` in `config.json` |
+| `agy 找不到橋產生的角色代理檔` ("agy cannot find the agent file the bridge wrote") | A new agy version changed behaviour; please open an issue on GitHub |
+| console: `埠 5499 被佔用了，橋沒啟動` ("port 5499 is in use, the bridge did not start") | Another bridge may already be running (one inside SillyTavern plus a standalone, say). For two of them, change `port` in `config.json` and the URL in SillyTavern |
 
-"useG1Credits is on" on the status page: this is agy's global setting; once the free quota is used up it silently charges paid AI credits. The bridge never changes it; whether to turn it off is your call.
+`useG1Credits 是開的` ("useG1Credits is on") on the status page: this is agy's global setting; once the free quota is used up it silently charges paid AI credits. The bridge never changes it; whether to turn it off is your call.
 
-### File-system virtualization in MSIX-packaged apps (letting the Claude desktop app install agy bites)
+### File-system virtualization in MSIX-packaged apps, "MSIX 封裝 App 的檔案虛擬化" (letting the Claude desktop app install agy bites)
+
+The red notice and the status page point here by the Chinese title, `README「MSIX 封裝 App 的檔案虛擬化」`.
 
 Windows only: MSIX and file-system virtualization are Windows mechanisms; macOS / Linux have nothing of the kind, and on those platforms the bridge neither shows this hint nor looks into any drawer.
 

@@ -61,11 +61,13 @@ let agyCheckInflight = null;
  * Run at startup (with retries) and whenever /status is opened while something is missing, so a
  * one-off failure at SillyTavern's startup does not stick until the next restart.
  */
-function checkAgy() {
+function checkAgy({ fresh = true } = {}) {
   if (agyCheckInflight) return agyCheckInflight;
   agyCheckInflight = (async () => {
     const misses = [], platform = platformOf(cfg);
-    agyInfo.path = resolveAgyPath(cfg, misses);
+    // A re-check looks again (the remembered answer may be from before agy was there); the first check at
+    // startup reuses what init just looked up, so a slow PATH folder is not paid twice back to back.
+    agyInfo.path = resolveAgyPath(cfg, misses, { fresh });
     const fellBack = !cfg.agyPath && misses.length && agyInfo.path === path.basename(agyInfo.path);
     const missLine = () => agyMissLine(misses, process.env, process.cwd(), platform);
     if (fellBack) console.warn(`${TAG} ${missLine()}`);
@@ -615,7 +617,7 @@ export async function init(router) {
       // SillyTavern started, and could a minute later.
       const tries = cfg.agyInitRetries ?? AGY_INIT_RETRIES, waitMs = cfg.agyInitRetryMs ?? AGY_INIT_RETRY_MS;
       for (let i = 0; ; i++) {
-        await checkAgy();
+        await checkAgy({ fresh: i > 0 });
         if (agyInfo.version || i >= tries) break;
         console.warn(`${TAG} 第 ${i + 1} 次叫不動 agy，${waitMs / 1000} 秒後再試（最多再試 ${tries} 次）`);
         await new Promise(r => setTimeout(r, waitMs));
