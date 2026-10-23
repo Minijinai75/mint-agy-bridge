@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer, _setConfig, _setWorkspace, _setModels, _state, _forgetAgy, STALL_RETRY_NOTE } from '../index.mjs';
+import { maskHome } from '../lib/agy.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mint-test-'));
@@ -14,7 +15,7 @@ const dataDir = path.join(tmp, 'agydata');
 const ws = path.join(tmp, 'ws');
 const argsOut = path.join(tmp, 'args.json');
 const keptDir = path.join(tmp, 'kept-logs');
-const BASE_CFG = { host: '127.0.0.1', apiKey: '', agyPath: path.join(here, 'fixtures', 'fake-agy.mjs'), agyDataDir: dataDir, usageLog: false, framing: 'FRAME', stdinLimitBytes: 180000, maxRetries: 0, keepOnDisconnect: true, maxConcurrent: 2, printTimeoutSec: 300, watchdogExtraSec: 30, honorMaxTokens: true, stallSec: 120, stallRetry: true, statusRecheckMs: 5000, doneGraceMs: 5000, stallFirstSec: 180, keptLogsDir: keptDir, cleanupRetryMs: 300 };
+const BASE_CFG = { host: '127.0.0.1', apiKey: '', agyPath: path.join(here, 'fixtures', 'fake-agy.mjs'), agyDataDir: dataDir, usageLog: false, framing: 'FRAME', stdinLimitBytes: 180000, maxRetries: 0, keepOnDisconnect: true, maxConcurrent: 2, printTimeoutSec: 300, watchdogExtraSec: 30, honorMaxTokens: true, stallSec: 120, stallRetry: true, statusRecheckMs: 5000, doneGraceMs: 5000, stallFirstSec: 180, keptLogsDir: keptDir, cleanupRetryMs: 300, platform: process.platform };   // platform: not a config.json key — tests run the Windows branches on any OS by setting 'win32'
 let server, base;
 
 before(async () => {
@@ -515,7 +516,9 @@ test('max_tokens does not count a <think> block written into the reply', async (
 });
 
 test('/status: agy missing → agyPath advice first and the error code; agy back → looked up again, warning gone', async () => {
-  _setConfig({ agyPath: path.join(tmp, 'no-such-agy.exe').replace(/\\/g, '/').toUpperCase(), statusRecheckMs: 0 });   // forward slashes, other case: still masked
+  // A path under the home folder (nothing is created there): what is tested is the masking, and on macOS / Linux
+  // os.tmpdir() is not under the home folder. Forward slashes, the other case: still masked.
+  _setConfig({ agyPath: path.join(os.homedir(), 'mint-test-no-such', 'no-such-agy.exe').replace(/\\/g, '/').toUpperCase(), statusRecheckMs: 0 });
   let st = await (await fetch(`${base}/status`)).json();
   assert.equal(st.agy.version, null);
   assert.match(st.warnings[0], /agyPath/);
@@ -535,7 +538,7 @@ test('/status: agy missing → agyPath advice first and the error code; agy back
 test('/status: ENOENT on a path under AppData\\Local → the MSIX hint right after the agyPath advice; ENOENT elsewhere → no hint', async () => {
   const MSIX = /Claude 桌面版/;
   _forgetAgy();
-  _setConfig({ agyPath: path.join(tmp, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'), statusRecheckMs: 0 });
+  _setConfig({ agyPath: path.join(tmp, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'), statusRecheckMs: 0, platform: 'win32' });
   let st = await (await fetch(`${base}/status`)).json();
   assert.equal(st.agy.version, null);
   assert.match(st.agy.error, /ENOENT/);
@@ -555,12 +558,24 @@ test('/status: ENOENT on a path under AppData\\Local → the MSIX hint right aft
 
   // Same ENOENT, a path outside AppData\Local: no hint.
   _forgetAgy();
-  _setConfig({ agyPath: path.join(path.parse(tmp).root, `mint-no-such-${process.pid}`, 'agy.exe'), statusRecheckMs: 0 });
+  _setConfig({ agyPath: path.join(path.parse(tmp).root, `mint-no-such-${process.pid}`, 'agy.exe'), statusRecheckMs: 0, platform: 'win32' });
   st = await (await fetch(`${base}/status`)).json();
   assert.equal(st.agy.version, null);
   assert.match(st.agy.error, /ENOENT/);
-  assert.match(st.warnings[0], /agyPath/);
+  assert.match(st.warnings[0], /agyPath/); assert.match(st.warnings[0], /%LOCALAPPDATA%/);
   assert.ok(!st.warnings.some(w => MSIX.test(w)), JSON.stringify(st.warnings));
+
+  // The same AppData\Local path and the same ENOENT on macOS / Linux: MSIX is a Windows thing, no hint; the advice names which agy, not agy.exe.
+  for (const platform of ['linux', 'darwin']) {
+    _forgetAgy();
+    _setConfig({ agyPath: path.join(tmp, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'), statusRecheckMs: 0, platform });
+    st = await (await fetch(`${base}/status`)).json();
+    assert.equal(st.agy.version, null); assert.match(st.agy.error, /ENOENT/);
+    assert.match(st.warnings[0], /agyPath/); assert.match(st.warnings[0], /which agy/); assert.doesNotMatch(st.warnings[0], /agy\.exe|%LOCALAPPDATA%/);
+    if (platform === 'darwin') assert.match(st.warnings[0], /homebrew/);
+    assert.ok(!st.warnings.some(w => MSIX.test(w)), JSON.stringify(st.warnings));
+    assert.equal(st.agy.hiddenIn, undefined);
+  }
 
   // agy back: the hint goes with the error.
   _setConfig({ agyPath: BASE_CFG.agyPath, statusRecheckMs: 0 });
@@ -579,7 +594,7 @@ test('/status: the agy found in an app\'s LocalCache drawer → the warning name
   process.env.LOCALAPPDATA = fakeLocal;
   try {
     _forgetAgy();
-    _setConfig({ agyPath: path.join(tmp, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'), statusRecheckMs: 0 });
+    _setConfig({ agyPath: path.join(tmp, 'AppData', 'Local', 'agy', 'bin', 'agy.exe'), statusRecheckMs: 0, platform: 'win32' });
     const st = await (await fetch(`${base}/status`)).json();
     assert.equal(st.agy.version, null);
     assert.match(st.warnings[1], /agy 其實在 Claude_test1234 這個 App 的私人抽屜裡/);
@@ -596,18 +611,19 @@ test('/status: the agy found in an app\'s LocalCache drawer → the warning name
 
 // The real incident's path: no agyPath, the default location is missing, and "agy.exe" is not on PATH.
 // The status page judges from the default location; the chat error must carry the same verdict although
-// the spawn error only says "agy.exe".
-test('no agyPath, default location missing → MSIX hint on /status and in the chat error', { skip: process.platform !== 'win32' }, async () => {
-  const fakeLocal = path.join(tmp, 'fake-localappdata-empty');
+// the spawn error only says "agy.exe". Run as Windows on every OS (0.1.4): the fake LOCALAPPDATA is an
+// AppData\Local folder under the temp folder, so the default location fits the hint anywhere.
+test('no agyPath, default location missing → MSIX hint on /status and in the chat error', async () => {
+  const fakeLocal = path.join(tmp, 'AppData', 'Local');
   fs.mkdirSync(fakeLocal, { recursive: true });
   const emptyPath = path.join(tmp, 'empty-path');
   fs.mkdirSync(emptyPath, { recursive: true });
   const saved = { LOCALAPPDATA: process.env.LOCALAPPDATA, PATH: process.env.PATH };
-  process.env.LOCALAPPDATA = fakeLocal;      // under the real AppData\Local\Temp, so the default location fits the hint
+  process.env.LOCALAPPDATA = fakeLocal;
   process.env.PATH = emptyPath;              // a bare "agy.exe" must be ENOENT whatever this machine has installed
   try {
     _forgetAgy();
-    _setConfig({ agyPath: '', statusRecheckMs: 0 });
+    _setConfig({ agyPath: '', statusRecheckMs: 0, platform: 'win32' });
     const st = await (await fetch(`${base}/status`)).json();
     assert.equal(st.agy.version, null);
     assert.equal(st.agy.path, 'agy.exe');
@@ -622,4 +638,68 @@ test('no agyPath, default location missing → MSIX hint on /status and in the c
     _setConfig({ agyPath: BASE_CFG.agyPath, statusRecheckMs: 0 });
     await fetch(`${base}/status`);
   }
+});
+
+// ── 0.1.4: macOS / Linux ──────────────────────────────────────────────────
+// No agyPath, an executable named agy in a PATH folder (a wrapper around the fake): found through PATH, run
+// through PATH, and the status page shows where it is. Windows has no such wrapper (a .cmd cannot be run
+// without a shell), so there the PATH scan is covered by the unit tests only.
+test('no agyPath: an executable agy on PATH is found and run; /status shows its path (macOS / Linux)', { skip: process.platform === 'win32' }, async () => {
+  const binDir = path.join(tmp, 'path-bin'); fs.mkdirSync(binDir, { recursive: true });
+  const wrapper = path.join(binDir, 'agy');
+  fs.writeFileSync(wrapper, `#!/bin/sh\nexec "${process.execPath}" "${BASE_CFG.agyPath}" "$@"\n`); fs.chmodSync(wrapper, 0o755);
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${savedPath}`;
+  try {
+    _forgetAgy();
+    _setConfig({ agyPath: '', statusRecheckMs: 0 });
+    const st = await (await fetch(`${base}/status`)).json();
+    assert.equal(st.agy.version, '1.4.2', JSON.stringify(st.agy));
+    assert.equal(st.agy.path, maskHome(wrapper));
+    assert.equal(st.agy.error, undefined);
+    assert.deepEqual(st.warnings.filter(w => /agyPath|桌面版/.test(w)), []);
+    const j = await (await chat({ model: M, messages: msgs('經由 PATH') })).json();
+    assert.match(j.choices[0].message.content, /^echo:經由 PATH/);
+    // The found path is remembered per process (maintainer review: a dead network share on PATH costs 21 s per stat).
+    // agy moves to a later PATH folder: the next turn's spawn is ENOENT once, which drops the remembered path; the turn after finds it again.
+    const binDir2 = path.join(tmp, 'path-bin-2'); fs.mkdirSync(binDir2, { recursive: true });
+    process.env.PATH = `${binDir}:${binDir2}:${savedPath}`;
+    _forgetAgy(); await fetch(`${base}/status`);   // the re-check remembers binDir's wrapper with this PATH
+    const wrapper2 = path.join(binDir2, 'agy');
+    fs.writeFileSync(wrapper2, fs.readFileSync(wrapper)); fs.chmodSync(wrapper2, 0o755); fs.rmSync(wrapper);
+    const failed = await (await chat({ model: M, messages: msgs('搬家後第一發') })).json();
+    assert.match(failed.error.message, /找不到 agy 程式/); assert.match(failed.error.message, /ENOENT/);
+    const ok = await (await chat({ model: M, messages: msgs('搬家後第二發') })).json();
+    assert.match(ok.choices[0].message.content, /^echo:搬家後第二發/);
+    _forgetAgy();
+    const st2 = await (await fetch(`${base}/status`)).json();
+    assert.equal(st2.agy.path, maskHome(wrapper2)); assert.equal(st2.agy.version, '1.4.2');
+  } finally {
+    process.env.PATH = savedPath;
+    _setConfig({ agyPath: BASE_CFG.agyPath, statusRecheckMs: 0 });
+    await fetch(`${base}/status`);
+  }
+});
+
+// Is a process gone? ESRCH, or (Linux) a zombie nobody reaped yet.
+const gone = pid => {
+  try { process.kill(pid, 0); } catch { return true; }
+  try { return /^State:\s+Z/m.test(fs.readFileSync(`/proc/${pid}/status`, 'utf8')); } catch { return false; }
+};
+
+// A stopped agy takes the helpers it started with it: taskkill /T on Windows, the process group elsewhere
+// (before 0.1.4, SIGTERM reached agy alone and a helper of a stalled agy ran on).
+test('stall → agy is stopped together with the helper it started', async () => {
+  const pidFile = path.join(tmp, 'helper.pid'); fs.rmSync(pidFile, { force: true });
+  process.env.FAKE_AGY_GRANDCHILD_OUT = pidFile;
+  _setConfig({ stallFirstSec: 1, stallRetry: false });
+  try {
+    const body = await (await chat({ model: M, messages: msgs('#hanghelper'), stream: false })).json();
+    assert.match(body.error.message, /模型那頭 1 秒沒出字/);
+    const pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+    assert.ok(pid > 0, `helper pid: ${pid}`);
+    let left = true;
+    for (let i = 0; i < 50 && left; i++) { left = !gone(pid); if (left) await sleep(100); }
+    assert.equal(left, false, `helper ${pid} still running`);
+  } finally { delete process.env.FAKE_AGY_GRANDCHILD_OUT; }
 });

@@ -6,6 +6,8 @@
 //   #midfail    → stream some text, then fail with a network error (exit 3)
 //   #nonl       → the final result line has no trailing newline and reports a denied action
 //   #grandchild → leave a sleeping grandchild that keeps stdout open after agy exits
+//   #hanghelper → start a sleeping helper (its pid written to FAKE_AGY_GRANDCHILD_OUT), then hang: the bridge's
+//                 stop must end the helper too (taskkill /T on Windows, the process group elsewhere)
 //   #filter     → stream some text, then print Google's content-filter message on stderr and hang
 //                 (real agy retries the blocked reply until its timeout)
 //   #filter0    → the same, before any text
@@ -91,6 +93,12 @@ process.stdin.on('end', async () => {
     process.stderr.write('W1020 retry.go:88] Your previous response was blocked by content safety filters: The model output could not be generated. This output contains sensitive words that violate Google\'s Generative AI Prohibited Use policy. If you think this was an error, send feedback.\nPlease provide a response that complies with content policies, or briefly explain to the user why you cannot help with this request\nRetries remaining: 3\n');
     await sleep(20000);
     process.exit(1);
+  }
+  if (msg.includes('#hanghelper')) {
+    const { spawn } = await import('node:child_process');
+    const helper = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], { stdio: 'ignore' });
+    if (process.env.FAKE_AGY_GRANDCHILD_OUT) fs.writeFileSync(process.env.FAKE_AGY_GRANDCHILD_OUT, String(helper.pid));
+    await sleep(20000); process.exit(0);
   }
   if (msg.includes('#hang')) { await sleep(20000); process.exit(0); }
   if (msg.includes('#exit1')) process.exit(1);
